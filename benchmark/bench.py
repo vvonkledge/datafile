@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark every datafile.py action across JSONL store sizes up to 5 GB.
+"""Benchmark every datafile.py action across JSONL store sizes up to 2 GB.
 
 Each action runs as its own process. Wall time comes from a monotonic clock,
 peak RSS from /usr/bin/time -l (rusage), and a watchdog kills any process that
@@ -10,7 +10,6 @@ import contextlib
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -32,7 +31,8 @@ POLL = 0.05
 
 MB, GB = 1024**2, 1024**3
 SIZES = [("1MB", MB), ("10MB", 10 * MB), ("100MB", 100 * MB), ("500MB", 500 * MB),
-         ("1GB", GB), ("2GB", 2 * GB), ("5GB", 5 * GB)]
+         ("1GB", GB), ("2GB", 2 * GB)]
+MASTER_BYTES = max(n for _, n in SIZES)   # every tier is a prefix of the master
 
 RSS_RE = re.compile(rb"(\d+)\s+maximum resident set size")
 
@@ -112,12 +112,12 @@ def plan(path: str, nrecords: int) -> list[tuple[str, list[str], bool]]:
 def main():
     only = sys.argv[1:] or None
     master = os.path.join(DATA, "events-master.jsonl")
-    if not os.path.exists(master) or os.path.getsize(master) < 5 * GB:
-        print("generating 5GB master ...", flush=True)
+    if not os.path.exists(master) or os.path.getsize(master) < MASTER_BYTES:
+        print(f"generating {MASTER_BYTES/GB:.0f}GB master ...", flush=True)
         t = time.monotonic()
         sys.path.insert(0, HERE)
         from gen_events import gen
-        n, b = gen(master, 5 * GB)
+        n, b = gen(master, MASTER_BYTES)
         print(f"  {n} records, {b/GB:.2f} GB in {time.monotonic()-t:.1f}s", flush=True)
 
     failed: set[str] = set()
@@ -133,15 +133,10 @@ def main():
                 continue
             path = os.path.join(DATA, f"events-{label}.jsonl")
             sidecar_rm(path)
-            if label == "5GB":
-                with open(master, "rb") as f:
-                    nrec = sum(1 for _ in f)
-                size = os.path.getsize(master)
-                shutil.copyfile(master, path)   # keep the master pristine for reruns
-            else:
-                sys.path.insert(0, HERE)
-                from gen_events import truncate_at_line
-                nrec, size = truncate_at_line(master, path, nbytes)
+            sys.path.insert(0, HERE)
+            from gen_events import truncate_at_line
+            # a copy, not the master itself: the mutating actions rewrite it
+            nrec, size = truncate_at_line(master, path, nbytes)
             print(f"\n=== {label}: {nrec:,} records, {size/MB:.1f} MB ===", flush=True)
             for name, argv, cold in plan(path, nrec):
                 if name in failed:

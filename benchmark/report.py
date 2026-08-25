@@ -6,7 +6,7 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 ACTIONS = ["schema", "get (cold idx)", "get (warm idx)", "keys", "list --limit 100",
            "validate", "put (1 record)", "delete", "compact", "repair"]
-SIZES = ["1MB", "10MB", "100MB", "500MB", "1GB", "2GB", "5GB"]
+SIZES = ["1MB", "10MB", "100MB", "500MB", "1GB", "2GB"]
 
 
 def load():
