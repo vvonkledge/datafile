@@ -1,0 +1,9 @@
+name: Event
+key: event_id
+extra: forbid
+fields:
+  event_id: {type: uuid}
+  kind:     {type: enum, values: [click, view, purchase]}
+  amount:   {type: float, ge: 0, required: false}
+  at:       {type: datetime}
+  props:    {type: dict, default: {}}

@@ -1,0 +1,38 @@
+name: User
+key: id                 # which field is the primary key
+extra: forbid           # forbid | ignore | allow
+
+fields:
+  id:
+    type: str
+    pattern: '^[a-z][a-z0-9-]{1,31}$'
+
+  name:
+    type: str
+    min_length: 1
+    max_length: 100
+
+  age:
+    type: int
+    ge: 0
+    le: 150
+
+  email:
+    type: email
+    required: false     # -> Optional, defaults to null
+
+  role:
+    type: enum
+    values: [admin, member, guest]
+    default: member     # a default implies optional, type stays non-null
+
+  tags:
+    type: list
+    items: str
+    default: []
+
+  joined:
+    type: datetime
+    required: false
+
+  note: str             # shorthand for {type: str}

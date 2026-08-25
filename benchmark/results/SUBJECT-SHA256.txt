@@ -1,0 +1,7 @@
+43fab43cf84b17c1cab99db176cea2511c327e6fce314c0b24b0a2130ba37d3e  benchmark/subject/datafile.py
+b09228d434ef25f13129130a4b002062a375e270c322ceca24bac3604dd99b64  benchmark/subject/schema-events.yaml
+
+The sha256 of datafile.py and schema-events.yaml as they were when results.jsonl
+and report.md were recorded (before the `roll` command was added). bench.py now
+measures the working tree directly - git pins bytes for a rerun, so a checked-in
+copy of the source is no longer needed.

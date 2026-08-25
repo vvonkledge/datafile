@@ -1,0 +1,33 @@
+# Lint config for datafile.py and its test suite.
+#
+# Both files carry PEP 723 inline dependencies and are run with `uv run`, so
+# there is no pyproject.toml to hang this off - hence a standalone ruff.toml.
+#
+#   uvx ruff check .          # lint
+#   uvx ruff check --fix .    # apply the safe fixes
+
+target-version = "py311"
+# 100, not the more common 88. datafile.py generates JavaScript and TypeScript
+# from triple-quoted templates; a few of those lines run past 88 and cannot be
+# wrapped in Python without changing the emitted code, which would mark every
+# installed plugin stale. The hand-written Python already sits under 100.
+line-length = 100
+
+[lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RET", "PIE", "RUF"]
+
+ignore = [
+    # The CLI half of datafile.py imports argparse, yaml and pydantic below the
+    # Store class deliberately: `--version` must answer before those imports
+    # run, so a version probe costs interpreter startup and nothing else.
+    "E402",
+]
+
+# PTH (flake8-use-pathlib) is deliberately not selected. datafile.py works at
+# the file-descriptor level - os.open, os.fsync, os.replace, mkstemp - to get
+# durable atomic writes. Rewriting that as pathlib would lose the fd access it
+# depends on, and mixing both styles in one file reads worse than either.
+
+[lint.per-file-ignores]
+# Tests build partial objects and stub callables to exercise error paths.
+"test_datafile.py" = ["B017"]

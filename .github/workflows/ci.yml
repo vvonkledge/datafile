@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Lint
+        run: uvx ruff check .
+
+      - name: Tests
+        run: uv run test_datafile.py -q
+
+      # datafile.py generates its agent skill from the argparse tree, so adding
+      # a command silently stales it. The skill carries no machine-specific
+      # paths, so this check is portable.
+      #
+      # `pi-package --check` is deliberately NOT run here: pi-package bakes the
+      # generating machine's absolute path into README.md and
+      # extensions/ambient-context.ts as a PATH fallback, so the check can only
+      # pass on the machine that generated it. Verified failing on linux.
+      - name: Generated skill is current
+        run: uv run datafile.py skill --check --scope project --app pi

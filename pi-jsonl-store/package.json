@@ -1,0 +1,24 @@
+{
+  "name": "pi-jsonl-store",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Append-only JSONL record store with a runtime YAML contract",
+  "keywords": [
+    "pi-package",
+    "jsonl",
+    "contract",
+    "axi"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "private": true
+}
