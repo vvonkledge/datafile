@@ -46,10 +46,15 @@ uv run datafile.py --help
 To use it anywhere, put it on your `PATH`:
 
 ```sh
-chmod +x datafile.py
-ln -s "$PWD/datafile.py" ~/.local/bin/datafile
+just install                              # ~/.local/bin/datafile -> ./datafile.py
+just bindir=/usr/local/bin install        # somewhere else
+just uninstall
 datafile stores
 ```
+
+Without [just](https://just.systems), that is `chmod +x datafile.py` and a
+symlink into a directory on your `PATH`. The link is deliberate rather than a
+copy: the command tracks the checkout instead of going stale behind it.
 
 The script carries a `#!/usr/bin/env -S uv run --script` shebang, so the symlink
 works without a wrapper. `uv tool install` does not accept a bare script, only a
