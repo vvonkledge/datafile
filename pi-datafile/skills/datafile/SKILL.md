@@ -1,5 +1,5 @@
 ---
-name: jsonl-store
+name: datafile
 description: >-
   Read or write append-only JSONL data files whose records are validated
   against a YAML-defined contract. Use when adding, updating, deleting,
@@ -7,7 +7,7 @@ description: >-
   malformed lines to recover, or when defining a schema for one.
 ---
 
-# jsonl-store
+# datafile
 
 Append-only JSONL record store with a runtime YAML contract. Records are
 appended to a log, updated by appending a new version, and deleted with a
