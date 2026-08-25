@@ -326,6 +326,127 @@ class TestStoreCore:
             s.put({"name": "A", "age": 1, "note": "n"})
 
 
+class TestBoundedReads:
+    """list and keys must cost the index, not the store (§2/§9)."""
+
+    def test_page_materialises_only_the_limit(self, tmp_path, monkeypatch):
+        s = make_store(tmp_path)
+        for i in range(20):
+            s.put({"id": f"u{i}", "name": "A", "age": 1, "note": "n"})
+
+        calls = []
+        real = s.model.model_validate_json
+        monkeypatch.setattr(s.model, "model_validate_json",
+                            lambda raw, *a, **k: (calls.append(1), real(raw))[1])
+
+        records, total, bad = s.page(3)
+        assert [r.id for r in records] == ["u0", "u1", "u2"]
+        assert (total, bad) == (20, 0)
+        assert len(calls) == 3          # not 20: the other 17 are never parsed
+
+    def test_page_skips_and_counts_an_off_contract_row(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ok", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:                     # indexed, fails the contract
+            f.write('{"id":"nope","name":"","age":300,"note":"n"}\n')
+        records, total, bad = s.page(10)
+        assert [r.id for r in records] == ["ok"] and (total, bad) == (2, 1)
+
+    def test_unparseable_lines_counted_without_a_fold(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ok", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:
+            f.write("{bad\n{worse\n")
+        assert s.page(10)[2] == 2
+
+    def test_bad_count_survives_a_warm_sidecar(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ok", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:
+            f.write("{bad\n")
+        assert s.page(10)[2] == 1
+        assert json.loads(Path(s.idxpath).read_text())["bad"] == 1
+        fresh = store.Store(s.path, s.model, key=s.key)  # cold process, warm index
+        assert fresh.page(10)[2] == 1
+
+    def test_sidecar_without_a_bad_count_is_a_cold_cache(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ok", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:
+            f.write("{bad\n")
+        s.keys()
+        d = json.loads(Path(s.idxpath).read_text())
+        del d["bad"]                                     # a sidecar from an older build
+        Path(s.idxpath).write_text(json.dumps(d))
+        fresh = store.Store(s.path, s.model, key=s.key)
+        assert fresh.page(10)[2] == 1                    # rebuilt, not trusted blindly
+
+    def test_compact_clears_the_bad_count(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ok", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:
+            f.write("{bad\n")
+        assert s.page(10)[2] == 1
+        s.compact()
+        assert s.page(10)[2] == 0
+
+    def test_page_on_a_missing_store(self, tmp_path):
+        assert make_store(tmp_path).page(10) == ([], 0, 0)
+
+    def test_page_with_a_zero_limit_still_reports_the_total(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ok", "name": "A", "age": 1, "note": "n"})
+        assert s.page(0) == ([], 1, 0)
+
+    def test_keys_caps_output_and_reveals_the_total(self, workspace, cli):
+        for i in range(5):
+            cli("-f", "u.jsonl", "put", rec(id=f"u{i}"))
+        code, out, _ = cli("-f", "u.jsonl", "keys", "--limit", "2")
+        assert code == 0 and "count: 2 of 5 total" in out
+        assert "keys[2]: u0,u1" in out
+        assert "keys --limit 5" in out
+
+    def test_keys_under_the_limit_says_nothing_about_paging(self, workspace, cli):
+        cli("-f", "u.jsonl", "put", rec())
+        _, out, _ = cli("-f", "u.jsonl", "keys")
+        assert "count: 1 of 1 total" in out and "--limit" not in out
+
+    def test_keys_default_limit_matches_list(self, workspace, cli):
+        for i in range(store.DEFAULT_LIMIT + 5):
+            cli("-f", "u.jsonl", "put", rec(id=f"u{i:04d}"))
+        _, out, _ = cli("-f", "u.jsonl", "keys")
+        assert f"count: {store.DEFAULT_LIMIT} of {store.DEFAULT_LIMIT + 5} total" in out
+
+    def test_list_does_not_fold_the_whole_store(self, workspace, cli, monkeypatch):
+        for i in range(10):
+            cli("-f", "u.jsonl", "put", rec(id=f"u{i}"))
+
+        def boom(self):                 # the fold is what blew up memory
+            raise AssertionError("list must not call Store.load()")
+        monkeypatch.setattr(store.Store, "load", boom)
+
+        code, out, _ = cli("-f", "u.jsonl", "list", "--limit", "2")
+        assert code == 0 and "count: 2 of 10 total" in out
+
+    def test_list_hides_the_cap_hint_when_the_limit_was_not_the_constraint(
+            self, workspace, cli):
+        """A row the page skipped is not a row a bigger --limit would reveal."""
+        cli("-f", "u.jsonl", "put", rec())
+        with open("u.jsonl", "a") as f:
+            f.write('{"id":"nope","name":"","age":300,"note":"n"}\n')
+        _, out, _ = cli("-f", "u.jsonl", "list")
+        assert "count: 1 of 2 total" in out and "bad: 1" in out
+        assert "--limit" not in out and "validate" in out
+
+    def test_list_rejects_unknown_fields_before_reading(self, workspace, cli, monkeypatch):
+        cli("-f", "u.jsonl", "put", rec())
+        monkeypatch.setattr(store.Store, "page",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                AssertionError("read before validating --fields")))
+        code, out, _ = cli("-f", "u.jsonl", "list", "--fields", "nope")
+        assert code == 2 and "unknown field" in out
+
+
 class TestConcurrency:
     def test_compaction_does_not_lose_a_concurrent_append(self, tmp_path):
         c = tmp_path / "c.yaml"
@@ -1699,3 +1820,40 @@ class TestParseSize:
         with pytest.raises(store.AxiError) as e:
             store.parse_size(text)
         assert e.value.code == "USAGE_ERROR"
+
+
+class TestRollCoverageGaps:
+    """Paths in `roll` that the existing suite did not reach."""
+
+    def test_violation_scan_skips_unreadable_lines(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ada", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:
+            f.write("{not json\n")
+        assert s.append_only_violations() == (0, 0)
+
+    def test_roll_on_a_missing_file_is_none(self, tmp_path):
+        s = make_store(tmp_path)
+        assert s.roll(str(tmp_path / "archive")) is None
+
+    def test_roll_below_min_bytes_is_none(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ada", "name": "A", "age": 1, "note": "n"})
+        assert s.roll(str(tmp_path / "archive"), min_bytes=10_000_000) is None
+        assert Path(s.path).exists()          # log left untouched
+
+    def test_blank_lines_are_not_counted_as_records(self, tmp_path):
+        s = make_store(tmp_path)
+        s.put({"id": "ada", "name": "A", "age": 1, "note": "n"})
+        with open(s.path, "a") as f:
+            f.write("\n\n")
+        row = s.roll(str(tmp_path / "archive"))
+        assert row["records"] == 1
+
+    def test_archive_io_failure_is_structured(self, workspace, cli, monkeypatch):
+        cli("-f", "u.jsonl", "put", rec())
+        monkeypatch.setattr(store.Store, "roll",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("EXDEV")))
+        code, out, err = cli("-f", "u.jsonl", "roll")
+        assert code == 1 and err == ""
+        assert "IO_ERROR" in out and "same filesystem" in out

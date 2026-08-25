@@ -5,3 +5,7 @@ The sha256 of datafile.py and schema-events.yaml as they were when results.jsonl
 and report.md were recorded (before the `roll` command was added). bench.py now
 measures the working tree directly - git pins bytes for a rerun, so a checked-in
 copy of the source is no longer needed.
+
+Stale rows: `list --limit 100` and `keys` were measured before both were bounded
+by the offset index. Every other row still reflects current behaviour. The 5GB
+tier was dropped from bench.py; its rows were removed rather than left orphaned.

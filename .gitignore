@@ -7,7 +7,7 @@ __pycache__/
 htmlcov/
 
 # Benchmark scaffolding. The venv is rebuildable with `uv venv` and the data is
-# regenerable with gen_events.py in ~160s, so neither belongs in history. The
+# regenerable with gen_events.py in ~60s, so neither belongs in history. The
 # measurements in benchmark/results/ are kept.
 benchmark/.venv/
 benchmark/data/
