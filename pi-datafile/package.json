@@ -1,5 +1,5 @@
 {
-  "name": "pi-jsonl-store",
+  "name": "pi-datafile",
   "version": "0.1.0",
   "type": "module",
   "description": "Append-only JSONL record store with a runtime YAML contract",

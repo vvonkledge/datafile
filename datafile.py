@@ -1235,10 +1235,10 @@ def _records(args) -> list[dict]:
 
 # ------------------------------------------------------------ setup (§7)
 
-TOOL_NAME = "jsonl-store"           # stable identity: plugin file, skill, alias
+TOOL_NAME = "datafile"              # stable identity: plugin file, skill, alias
 # A managed hook is recognised by any of these appearing in its command, so an
 # entry installed as `uv run /path/datafile.py` is still found after the script is
-# symlinked onto PATH as `jsonl-store`, and vice versa.
+# symlinked onto PATH as `datafile`, and vice versa.
 MARKERS = ("datafile.py", TOOL_NAME)
 HOOK_TIMEOUT = 10
 OPENCODE_PREFIX = "axi managed opencode plugin:"
@@ -1585,7 +1585,7 @@ def cmd_setup(args) -> int:
 
 # --------------------------------------------------- installable skill (§7)
 
-SKILL_NAME = "jsonl-store"
+SKILL_NAME = TOOL_NAME
 SKILL_PATH = os.path.join(".agents", "skills", SKILL_NAME, "SKILL.md")
 
 

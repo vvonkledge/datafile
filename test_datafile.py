@@ -669,9 +669,9 @@ class TestCLI:
         assert code == 0 and out.strip() == store.VERSION
 
     def test_suggestions_use_the_invoked_name(self, workspace, cli, monkeypatch):
-        monkeypatch.setattr(store, "PROG", "jsonl-store")
+        monkeypatch.setattr(store, "PROG", "datafile")
         _, out, _ = cli("-f", "users.jsonl", "get", "nobody")
-        assert "Run `jsonl-store " in out and "datafile.py" not in out
+        assert "Run `datafile " in out and "datafile.py" not in out
 
 
 # ------------------------------------------------------------- discovery (§8)
@@ -760,7 +760,7 @@ class TestSkill:
     def test_frontmatter_is_trigger_shaped(self, workspace, cli):
         cli("skill", "--out", "S.md")
         text = Path("S.md").read_text()
-        assert text.startswith("---\nname: jsonl-store\ndescription: >-")
+        assert text.startswith("---\nname: datafile\ndescription: >-")
         assert "Use when" in text.split("---")[1]
 
     def test_documents_every_command(self, workspace, cli):
@@ -800,7 +800,7 @@ class TestSetup:
         assert (fake_home / ".claude" / "settings.json").exists()
         assert (fake_home / ".codex" / "hooks.json").exists()
         assert (fake_home / ".config" / "opencode" / "plugins"
-                / "axi-jsonl-store.js").exists()
+                / "axi-datafile.js").exists()
 
     def test_install_is_idempotent(self, fake_home, cli):
         cli("setup")
@@ -856,7 +856,7 @@ class TestSetup:
     def test_cross_form_marker_matching(self, fake_home, cli):
         cli("setup", "--app", "claude")
         settings = self._settings(fake_home)
-        settings["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "jsonl-store"
+        settings["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "datafile"
         (fake_home / ".claude" / "settings.json").write_text(json.dumps(settings))
         cli("setup", "--app", "claude", "--uninstall")
         assert "hooks" not in self._settings(fake_home)
@@ -883,7 +883,7 @@ class TestSetup:
     def test_opencode_plugin_is_marked_and_removable(self, fake_home, cli):
         cli("setup", "--app", "opencode")
         p = (fake_home / ".config" / "opencode" / "plugins"
-             / "axi-jsonl-store.js")
+             / "axi-datafile.js")
         assert p.read_text().startswith("// " + store.OPENCODE_PREFIX)
         cli("setup", "--app", "opencode", "--uninstall")
         assert not p.exists()
@@ -1138,10 +1138,10 @@ class TestCLIEdges:
     def test_prog_is_taken_from_argv_when_run_as_a_program(self, tmp_path,
                                                            monkeypatch, capsys):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(sys, "argv", ["/usr/local/bin/jsonl-store", "--version"])
+        monkeypatch.setattr(sys, "argv", ["/usr/local/bin/datafile", "--version"])
         try:
             assert store.main() == 0
-            assert store.PROG == "jsonl-store"
+            assert store.PROG == "datafile"
         finally:
             store.PROG = "datafile.py"
         capsys.readouterr()
@@ -1221,13 +1221,13 @@ class TestSetupEdges:
                                                     tmp_path, monkeypatch):
         bindir = tmp_path / "bin"
         bindir.mkdir()
-        (bindir / "jsonl-store").symlink_to(DATAFILE_PY)
+        (bindir / "datafile").symlink_to(DATAFILE_PY)
         monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
         cli("setup", "--app", "claude")
         cmds = [h["command"]
                 for g in self._read_claude(fake_home)["hooks"]["SessionStart"]
                 for h in g["hooks"]]
-        assert cmds == ["jsonl-store"]
+        assert cmds == ["datafile"]
 
     def test_unreadable_path_entries_are_skipped(self, monkeypatch):
         monkeypatch.setenv("PATH", "/does/not/exist")
@@ -1487,13 +1487,13 @@ class TestMutationGaps:
 
 class TestSkillInstall:
     def _path(self, home):
-        return home / ".claude" / "skills" / "jsonl-store" / "SKILL.md"
+        return home / ".claude" / "skills" / "datafile" / "SKILL.md"
 
     def test_installs_where_the_agent_reads_skills(self, fake_home, cli):
         code, out, _ = cli("skill", "--install")
         assert code == 0 and "installed" in out
         assert self._path(fake_home).exists()
-        assert self._path(fake_home).read_text().startswith("---\nname: jsonl-store")
+        assert self._path(fake_home).read_text().startswith("---\nname: datafile")
 
     def test_install_is_idempotent(self, fake_home, cli):
         cli("skill", "--install")
@@ -1503,14 +1503,14 @@ class TestSkillInstall:
 
     def test_install_refreshes_stale_content(self, fake_home, cli):
         cli("skill", "--install")
-        self._path(fake_home).write_text("---\nname: jsonl-store\n---\nstale\n")
+        self._path(fake_home).write_text("---\nname: datafile\n---\nstale\n")
         code, out, _ = cli("skill", "--install")
         assert code == 0 and "regenerated" in out
         assert "stale" not in self._path(fake_home).read_text()
 
     def test_project_scope_stays_local(self, fake_home, cli, tmp_path):
         cli("skill", "--install", "--scope", "project")
-        assert (tmp_path / ".claude" / "skills" / "jsonl-store"
+        assert (tmp_path / ".claude" / "skills" / "datafile"
                 / "SKILL.md").exists()
         assert not self._path(fake_home).exists()
 
@@ -1550,10 +1550,10 @@ class TestSkillMultiAgent:
     """pi discovers .agents/skills; Claude Code discovers .claude/skills."""
 
     def _claude(self, home):
-        return home / ".claude" / "skills" / "jsonl-store" / "SKILL.md"
+        return home / ".claude" / "skills" / "datafile" / "SKILL.md"
 
     def _pi(self, home):
-        return home / ".agents" / "skills" / "jsonl-store" / "SKILL.md"
+        return home / ".agents" / "skills" / "datafile" / "SKILL.md"
 
     def test_install_covers_both_agents(self, fake_home, cli):
         code, out, _ = cli("skill", "--install")
@@ -1580,7 +1580,7 @@ class TestSkillMultiAgent:
         """pi walks up from cwd looking for .agents/skills, which is also where
         the plain `skill` command writes - so they must agree."""
         cli("skill", "--install", "--app", "pi", "--scope", "project")
-        installed = tmp_path / ".agents" / "skills" / "jsonl-store" / "SKILL.md"
+        installed = tmp_path / ".agents" / "skills" / "datafile" / "SKILL.md"
         assert installed.exists()
         assert str(installed).endswith(store.SKILL_PATH)
 
@@ -1589,7 +1589,7 @@ class TestSkillMultiAgent:
         for p in (self._claude(fake_home), self._pi(fake_home)):
             assert p.name == "SKILL.md"
             assert p.parent.name == store.SKILL_NAME
-            assert p.read_text().startswith("---\nname: jsonl-store\n")
+            assert p.read_text().startswith("---\nname: datafile\n")
 
     def test_partial_uninstall_reports_per_agent(self, fake_home, cli):
         cli("skill", "--install", "--app", "pi")
@@ -1610,7 +1610,7 @@ class TestSkillMultiAgent:
 class TestPiPackage:
     FILES: ClassVar[set[str]] = {
         "package.json", "README.md", "extensions/ambient-context.ts",
-        "skills/jsonl-store/SKILL.md"}
+        "skills/datafile/SKILL.md"}
 
     def test_generates_the_full_layout(self, workspace, cli):
         code, out, _ = cli("pi-package")

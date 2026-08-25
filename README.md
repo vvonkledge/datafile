@@ -316,7 +316,7 @@ datafile.py setup --uninstall
 
 ```sh
 datafile.py pi-package
-pi install /path/to/pi-jsonl-store
+pi install /path/to/pi-datafile
 ```
 
 The skill is generated from the CLI's own parser and contract loader, so it
