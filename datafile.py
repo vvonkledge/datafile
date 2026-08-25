@@ -67,6 +67,7 @@ class Store(Generic[M]):
         self._offsets: dict[str, int] = {}   # id -> byte offset of latest version
         self._ino: int | None = None         # inode the index was built against
         self._size = 0                       # bytes of the log already indexed
+        self._bad = 0                        # unparseable lines in the indexed span
 
     # ---------------------------------------------------------------- locking
 
@@ -156,21 +157,24 @@ class Store(Generic[M]):
     def _refresh_index_unlocked(self) -> None:
         """Bring the offset index up to date. O(new bytes), not O(file)."""
         if not os.path.exists(self.path):
-            self._offsets, self._ino, self._size = {}, None, 0
+            self._offsets, self._ino, self._size, self._bad = {}, None, 0, 0
             return
         st = os.stat(self.path)
 
         if self._ino is None:                       # first use: try the sidecar
             d = self._read_sidecar()
             if d and d["ino"] == st.st_ino and d["size"] <= st.st_size:
-                self._offsets, self._ino, self._size = d["offsets"], d["ino"], d["size"]
+                self._offsets, self._ino = d["offsets"], d["ino"]
+                self._size, self._bad = d["size"], d["bad"]
 
         if self._ino != st.st_ino or st.st_size < self._size:
-            self._offsets, self._ino, self._size = {}, st.st_ino, 0   # compacted
+            self._offsets, self._ino = {}, st.st_ino          # compacted
+            self._size, self._bad = 0, 0
 
         if st.st_size > self._size:
             for off, _ln, rec, _bad in self._scan_unlocked(self._size):
                 if rec is None:
+                    self._bad += 1
                     continue
                 if rec.get(TOMBSTONE):
                     self._offsets.pop(rec[self.key], None)
@@ -183,12 +187,13 @@ class Store(Generic[M]):
         try:
             with open(self.idxpath, encoding="utf-8") as f:
                 d = json.load(f)
-            return d if {"ino", "size", "offsets"} <= d.keys() else None
+            return d if {"ino", "size", "offsets", "bad"} <= d.keys() else None
         except (OSError, json.JSONDecodeError):
             return None          # a bad index is only a cold cache, never fatal
 
     def _write_sidecar(self) -> None:
-        payload = {"ino": self._ino, "size": self._size, "offsets": self._offsets}
+        payload = {"ino": self._ino, "size": self._size, "bad": self._bad,
+                   "offsets": self._offsets}
         with contextlib.suppress(OSError):
             self._atomic_write(self.idxpath, json.dumps(payload))
 
@@ -214,6 +219,31 @@ class Store(Generic[M]):
         with self._lock(shared=True):
             self._refresh_index_unlocked()
             return list(self._offsets)
+
+    def page(self, limit: int) -> tuple[list[M], int, int]:
+        """The first `limit` live records, each materialised by one seek.
+
+        Returns (records, live total, unreadable lines). Unlike load(), which
+        holds a model per record, this holds `limit` of them, so `list` on a
+        huge store costs the index and nothing more. The line count is exact
+        for unparseable lines and adds any off-contract row met while filling
+        the page; `validate` remains the authoritative full check."""
+        with self._lock(shared=True):
+            self._refresh_index_unlocked()
+            total, bad = len(self._offsets), self._bad
+            out: list[M] = []
+            if total and limit > 0:
+                with open(self.path, "rb") as f:
+                    for off in self._offsets.values():
+                        f.seek(off)
+                        try:
+                            out.append(self.model.model_validate_json(f.readline()))
+                        except ValidationError:
+                            bad += 1        # indexed but off-contract, as in get()
+                            continue
+                        if len(out) == limit:
+                            break
+            return out, total, bad
 
     def load(self) -> tuple[dict[str, M], list[BadLine]]:
         """Full fold. Returns (records_by_id, bad_lines). Never raises."""
@@ -258,6 +288,7 @@ class Store(Generic[M]):
             buf.append(line)
         self._atomic_write(self.path, b"".join(buf))
         self._offsets, self._ino, self._size = offsets, os.stat(self.path).st_ino, pos
+        self._bad = 0
         self._write_sidecar()
         return len(alive), len(bad)
 
@@ -326,7 +357,7 @@ class Store(Generic[M]):
                 os.fsync(dfd)          # persist the rename and the new empty log
             finally:
                 os.close(dfd)
-            self._offsets, self._size = {}, 0
+            self._offsets, self._size, self._bad = {}, 0, 0
             self._ino = os.stat(self.path).st_ino
             with contextlib.suppress(OSError):
                 os.unlink(self.idxpath)     # stale: it maps the old inode
@@ -877,10 +908,8 @@ def _default_fields(model, key: str) -> list[str]:
 
 def cmd_list(args) -> int:
     s, model, key = _open(args)
-    alive, bad = s.load()
-    records = list(alive.values())
 
-    if args.fields:
+    if args.fields:                          # a usage error should not read the log
         fields = [f.strip() for f in args.fields.split(",") if f.strip()]
         unknown = [f for f in fields if f not in model.model_fields]
         if unknown:
@@ -890,18 +919,19 @@ def cmd_list(args) -> int:
     else:
         fields = _default_fields(model, key)
 
-    if not records:                                          # §5
+    shown, total, bad = s.page(args.limit)
+
+    if not total:                                          # §5
         out = {"records": f"0 records in {args.file}"}
         if bad:
-            out["bad"] = len(bad)
+            out["bad"] = bad
         out["help"] = [f"Run `datafile.py -f {args.file} put '{{...}}'` to add one"]
         if bad:
             out["help"].append(f"Run `datafile.py -f {args.file} validate` to see "
-                               f"{len(bad)} unreadable line(s)")
+                               f"{bad} unreadable line(s)")
         emit(out)
         return 0
 
-    shown = records[:args.limit]
     rows, clipped = [], False
     for r in shown:
         d = r.model_dump(mode="json")
@@ -915,20 +945,20 @@ def cmd_list(args) -> int:
             row[f] = v
         rows.append(row)
 
-    out: dict = {"count": f"{len(shown)} of {len(records)} total"}  # §4 aggregate
+    out: dict = {"count": f"{len(shown)} of {total} total"}   # §4 aggregate
     if bad:
-        out["bad"] = len(bad)
+        out["bad"] = bad
     out[os.path.basename(args.file)[:-6] or "records"] = rows
     help_lines = [f"Run `datafile.py -f {args.file} get <id>` for one record with all fields"]
-    if len(shown) < len(records):                            # §9 reveal truncation
-        help_lines.append(f"Run `datafile.py -f {args.file} list --limit {len(records)}` "
-                          f"for all {len(records)} records")
+    if len(shown) == args.limit and args.limit < total:       # §9 reveal truncation
+        help_lines.append(f"Run `datafile.py -f {args.file} list --limit {total}` "
+                          f"for all {total} records")
     if clipped:
         help_lines.append(f"Run `datafile.py -f {args.file} get <id> --full` "
                           f"for untruncated values")
     if bad:
         help_lines.append(f"Run `datafile.py -f {args.file} validate` to see "
-                          f"{len(bad)} unreadable line(s)")
+                          f"{bad} unreadable line(s)")
     out["help"] = help_lines
     emit(out)
     return 0
@@ -1008,7 +1038,12 @@ def cmd_keys(args) -> int:
         emit({"keys": f"0 records in {args.file}",
               "help": [f"Run `datafile.py -f {args.file} put '{{...}}'` to add one"]})
         return 0
-    emit({"count": len(ks), "keys": ks})
+    shown = ks[:args.limit]
+    out: dict = {"count": f"{len(shown)} of {len(ks)} total", "keys": shown}
+    if len(shown) < len(ks):                                 # §9 reveal truncation
+        out["help"] = [f"Run `datafile.py -f {args.file} keys --limit {len(ks)}` "
+                       f"for all {len(ks)} ids"]
+    emit(out)
     return 0
 
 
@@ -1983,7 +2018,11 @@ def build_parser() -> tuple[AxiParser, dict]:
     sp.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                     help=f"max records (default: {DEFAULT_LIMIT})")
 
-    add("keys", "list record ids only", "examples:\n  datafile.py -f u.jsonl keys")
+    sp = add("keys", "list record ids only",
+             "examples:\n  datafile.py -f u.jsonl keys\n"
+             "  datafile.py -f u.jsonl keys --limit 5000")
+    sp.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
+                    help=f"max ids (default: {DEFAULT_LIMIT})")
 
     sp = add("stores", "find .jsonl stores and their contracts",
              "examples:\n  datafile.py stores\n  datafile.py stores --depth 6\n"

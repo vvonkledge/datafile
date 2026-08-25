@@ -38,7 +38,7 @@ the current directory and is the cheapest way to orient.
 | `put` | insert or update records | --set |
 | `get` | read one record | --full |
 | `list` | list records | --fields, --limit (default: 100) |
-| `keys` | list record ids only | - |
+| `keys` | list record ids only | --limit (default: 100) |
 | `stores` | find .jsonl stores and their contracts | --depth (default: 3), --all |
 | `delete` | remove one record | - |
 | `validate` | check every line against the contract | --strict |
@@ -78,6 +78,7 @@ datafile.py -f u.jsonl list --fields id,name,age --limit 500
 
 ```sh
 datafile.py -f u.jsonl keys
+datafile.py -f u.jsonl keys --limit 5000
 ```
 
 **stores**
