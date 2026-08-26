@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A dropped push event leaves main unbumped with no way to replay the run:
+  # re-running an old run replays that run's commit, and the push cannot be
+  # resent. Without this trigger the only recovery is bumping locally, which
+  # skips the `check` gate entirely. Observed on 2026-08-26, when the merges of
+  # #5 and #6 produced no run at all.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -58,7 +64,11 @@ jobs:
   # carries [skip ci], so this cannot retrigger itself.
   bump:
     needs: check
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Dispatch is a manual replay of a push, so it bumps too; the ref guard
+    # keeps it to main, since the dispatch UI offers any branch.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
