@@ -1857,3 +1857,196 @@ class TestRollCoverageGaps:
         code, out, err = cli("-f", "u.jsonl", "roll")
         assert code == 1 and err == ""
         assert "IO_ERROR" in out and "same filesystem" in out
+
+
+# ------------------------------------------------------------ durability (§9)
+
+class _FsyncTrace:
+    """Records the durability-relevant syscalls in the order they are issued.
+
+    Distinguishes an fsync on a directory fd from one on a file fd, because the
+    ordering guarantee for a rewrite is specifically fsync(file) before the
+    rename and fsync(dir) after it.
+    """
+
+    def __init__(self, monkeypatch):
+        self.events = []
+        self._dirfds = {}
+        real_fsync, real_replace = os.fsync, os.replace
+        real_open, real_close = os.open, os.close
+
+        def fsync(fd):
+            self.events.append(("fsync", "dir" if fd in self._dirfds else "file"))
+            return real_fsync(fd)
+
+        def replace(src, dst):
+            self.events.append(("replace", os.path.basename(str(dst))))
+            return real_replace(src, dst)
+
+        def opn(path, *a, **k):
+            fd = real_open(path, *a, **k)
+            if os.path.isdir(path):
+                self._dirfds[fd] = path
+            return fd
+
+        def close(fd):
+            self._dirfds.pop(fd, None)
+            return real_close(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(os, "open", opn)
+        monkeypatch.setattr(os, "close", close)
+
+    @property
+    def kinds(self):
+        return [e[0] for e in self.events]
+
+
+class TestDurability:
+    """The write ordering is the testable half of the durability claim. What is
+    not testable in software is whether fsync reaches the medium; see the
+    Durability section of README.md, and test_fsync_is_deliberately_not_fullfsync
+    below, which pins the decision the README documents.
+    """
+
+    def test_append_fsyncs_the_data_file_once(self, tmp_path, monkeypatch):
+        s = make_store(tmp_path)
+        t = _FsyncTrace(monkeypatch)
+        s.put({"id": "ada", "name": "A", "age": 1, "note": "n"})
+        assert t.events == [("fsync", "file")]
+        assert os.path.getsize(s.path) > 0
+
+    def test_rewrite_orders_fsync_then_rename_then_dir_fsync(self, tmp_path,
+                                                             monkeypatch):
+        s = make_store(tmp_path)
+        for i in range(3):
+            s.put({"id": "ada", "name": f"A{i}", "age": 1, "note": "n"})
+        s.put({"id": "bob", "name": "B", "age": 1, "note": "n"})
+        s.delete("bob")
+
+        t = _FsyncTrace(monkeypatch)
+        s.compact()
+
+        # Every rename must be bracketed: the temp file durable before it, the
+        # directory entry durable after it. Compaction rewrites the log and the
+        # .idx sidecar, so there is more than one.
+        renames = [i for i, k in enumerate(t.kinds) if k == "replace"]
+        assert renames, "compact issued no rename"
+        for r in renames:
+            before = [e for e in t.events[:r] if e == ("fsync", "file")]
+            after = [e for e in t.events[r:] if e == ("fsync", "dir")]
+            assert before, f"rename at {r} was not preceded by fsync(file)"
+            assert after, f"rename at {r} was not followed by fsync(dir)"
+
+    @staticmethod
+    def _abort_at(s, op, boundary):
+        """Run op with the nth fsync/rename raising instead of completing.
+        Returns False once boundary is past the end of the operation."""
+        real_fsync, real_replace = os.fsync, os.replace
+        hits = [0]
+
+        def trip():
+            hits[0] += 1
+            if hits[0] == boundary + 1:
+                raise OSError("simulated crash")
+
+        def fsync(fd):
+            trip()
+            return real_fsync(fd)
+
+        def replace(src, dst):
+            trip()
+            return real_replace(src, dst)
+
+        os.fsync, os.replace = fsync, replace
+        try:
+            if op == "append":
+                s.put({"id": "cy", "name": "C", "age": 1, "note": "n"})
+            else:
+                s.compact()
+            return False
+        except OSError:
+            return True
+        finally:
+            os.fsync, os.replace = real_fsync, real_replace
+
+    @pytest.mark.parametrize("op", ["append", "compact"])
+    def test_crash_at_any_boundary_keeps_committed_records(self, tmp_path, op):
+        """Abort at each fsync/rename boundary in turn, then reopen the store
+        cold. A record committed before the crash must still read."""
+        boundary = 0
+        while True:
+            d = tmp_path / f"{op}{boundary}"
+            d.mkdir()
+            s = make_store(d)
+            s.put({"id": "ada", "name": "A", "age": 1, "note": "n"})
+            if op == "compact":
+                s.put({"id": "bob", "name": "B", "age": 1, "note": "n"})
+                s.delete("bob")
+
+            if not self._abort_at(s, op, boundary):      # boundaries exhausted
+                assert boundary > 0, f"{op} issued no fsync or rename at all"
+                break
+
+            cold = store.Store(s.path, s.model, key=s.key)   # nothing in memory
+            alive, _ = cold.load()
+            assert "ada" in alive, \
+                f"{op}: committed record lost by a crash at boundary {boundary}"
+            boundary += 1
+
+    def test_torn_write_at_every_byte_is_recoverable(self, tmp_path):
+        """A power loss during an append presents as a partially written final
+        record, not a clean abort. Cut at every byte inside that record and
+        require that committed records still read and that the torn line cannot
+        swallow the append that follows it.
+
+        The record carries multi-byte UTF-8, so some cuts land mid-codepoint and
+        leave bytes that are not valid UTF-8 at all.
+        """
+        srcdir = tmp_path / "src"
+        srcdir.mkdir()
+        s = make_store(srcdir)
+        s.put({"id": "ada", "name": "A", "age": 1, "note": "n"})
+        s.put({"id": "bob", "name": "B", "age": 1, "note": "n"})
+        before = os.path.getsize(s.path)
+        s.put({"id": "cy", "name": "C" + "é中\U0001f600" * 20,
+               "age": 1, "note": "n"})
+        full = Path(s.path).read_bytes()
+        model, key = s.model, s.key                  # compile the contract once
+
+        work = tmp_path / "work"
+        work.mkdir()
+        target = work / "d.jsonl"
+        cuts = range(before, len(full))
+        assert len(cuts) > 100, "expected a wide torn-write surface"
+
+        for cut in cuts:
+            for stale in work.glob("d.jsonl.*"):     # .idx and .lock sidecars
+                stale.unlink()
+            target.write_bytes(full[:cut])
+
+            cold = store.Store(str(target), model, key=key)
+            alive, _ = cold.load()
+            assert "ada" in alive and "bob" in alive, \
+                f"cut at byte {cut} lost a committed record"
+
+            cold.put({"id": "zed", "name": "Z", "age": 1, "note": "n"})
+            after = store.Store(str(target), model, key=key)
+            alive2, _ = after.load()
+            assert {"ada", "bob", "zed"} <= set(alive2), \
+                f"cut at byte {cut}: torn tail swallowed the next append"
+
+    def test_fsync_is_deliberately_not_fullfsync(self):
+        """On macOS, fsync() does not flush the drive's write cache; only
+        fcntl(fd, F_FULLFSYNC) does. datafile does not issue it, at roughly a
+        110x saving per write. That is a documented trade, not an oversight.
+
+        This pins the decision to the documentation: if the calls ever change,
+        the Durability section of README.md has to change with them.
+        """
+        src = DATAFILE_PY.read_text()
+        assert "F_FULLFSYNC" not in src
+        assert src.count("os.fsync(") == 5
+        readme = (HERE / "README.md").read_text()
+        assert "## Durability" in readme and "F_FULLFSYNC" in readme
