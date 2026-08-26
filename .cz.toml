@@ -9,7 +9,7 @@
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.1.1"
 tag_format = "v$version"
 
 # cz tags lightweight by default, but `git push --follow-tags` only pushes
