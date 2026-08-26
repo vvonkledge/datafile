@@ -34,6 +34,9 @@ means rewriting everything after it.
 This is how Kafka, RocksDB, and Git work. Writes stay O(1), and a byte-level
 corruption costs you one line rather than the whole file.
 
+New here? [RUNBOOK.md](RUNBOOK.md) walks through install, a first store, and
+day-2 operations step by step. This README covers the design and the reference.
+
 ## Install
 
 Requires [uv](https://docs.astral.sh/uv/). Dependencies are declared inline
@@ -338,7 +341,9 @@ cannot drift. `--check` fails if the committed copy is stale.
   because compaction replaces the data file's inode, and a lock held on the data
   file would stop excluding anyone.
 - **Atomic rewrites.** Temp file, fsync, `os.replace`, then fsync the directory
-  so the rename itself survives power loss. File permissions are preserved.
+  so the rename is persisted rather than left in the page cache. File permissions
+  are preserved. How far that guarantee actually reaches depends on the platform,
+  and on macOS it stops short: see [Durability](#durability).
 - **Torn-tail guard.** An append checks the final byte first and closes an
   unterminated line, so a half-written record cannot swallow the next one.
 
@@ -352,27 +357,80 @@ Reach for SQLite instead when:
   hundred MB.
 - **You query by anything but the primary key.** There are no secondary indexes,
   so everything else is a full scan.
+- **You need durability across a power cut on macOS.** `fsync` there does not
+  reach the drive's media. See [Durability](#durability).
 
 The question that decides it: does a human or an agent need to read and diff
 this file directly? If yes, a JSONL log is greppable, diffable, and recoverable
 line by line. If no, SQLite gives you indexes, transactions, and real
 concurrency in one portable file.
 
-Durability note: `fsync` correctness cannot be verified by a test suite. It is
-implemented, but only a power-loss test would prove it.
+## Durability
+
+The write ordering is the part a log store has to get right, and it is testable:
+appends are `write` then `flush` then `fsync`; rewrites are temp file, `fsync`,
+`os.replace`, then `fsync` on the directory so the rename is persisted too; a
+torn tail is closed before the next append rather than left to swallow it. The
+suite covers those paths.
+
+What a test suite cannot reach is the layer underneath, and on macOS that layer
+does not do what the name suggests. **`fsync()` on macOS does not flush the
+drive's write cache.** Apple's own header says as much:
+
+```c
+#define F_FULLFSYNC  51   /* fsync + ask the drive to flush to the media */
+```
+
+Only `fcntl(fd, F_FULLFSYNC)` asks the drive to commit to media, and `datafile`
+does not issue it. The two are measurably distinct: on a local APFS volume,
+`fsync` returns in roughly 28us and `F_FULLFSYNC` in roughly 3ms, a factor of
+about 110.
+
+So on macOS the guarantee stops at the drive. A record survives a process crash
+or a kernel panic, because the data has reached the OS and the drive. It can
+still be lost to a power cut that hits while the write sits in the drive's
+volatile cache, even though `fsync` already returned. On Linux, `fsync` does
+flush the device cache and the guarantee holds.
+
+That is a deliberate default, not an oversight. Issuing `F_FULLFSYNC` on every
+append would cost about 110x per write, which is the wrong trade for a store
+whose reason to exist is a greppable file rather than a transactional database.
+SQLite reaches the same conclusion and exposes it as `PRAGMA fullfsync`, off by
+default. If you need the stronger guarantee on macOS, the change is to route the
+five `os.fsync` calls in `datafile.py` through `fcntl(fd, F_FULLFSYNC)` on
+Darwin, keeping `os.fsync` elsewhere.
+
+One claim stays genuinely unprovable in software: whether the kernel or the drive
+reorders writes across the rename. That is exactly what the directory `fsync`
+defends against, and only power-loss testing on real hardware would settle it.
 
 ## Development
 
 ```sh
-uv run test_datafile.py                                          # 281 tests
+uv run test_datafile.py                                          # 287 tests
 uv run test_datafile.py --cov=. --cov-branch --cov-report=term-missing
 datafile.py skill --check && datafile.py pi-package --check      # drift gates
 ```
 
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) and
+CI enforces it on pull requests. Merging to `main` runs
+[commitizen](https://commitizen-tools.github.io/commitizen/), which bumps the
+version, writes `CHANGELOG.md`, and tags the release. `CHANGELOG.md` and every
+version string are generated, so do not edit them by hand. See
+[RUNBOOK.md](RUNBOOK.md#10-commits-versions-and-releases).
+
 The suite holds 100% line and branch coverage. Coverage alone does not prove
 much, so the code is also checked by hand-written mutation tests: break the
-torn-tail guard, the lock mode, the inode check, or an off-by-one, and a named
-test fails.
+torn-tail guard, the lock mode, the inode check, the append `fsync`, the
+directory `fsync` after a rename, or an off-by-one, and a named test fails.
+
+`TestDurability` covers the testable half of the durability claim: that the
+append path issues exactly one `fsync` on the data file, that every rename is
+bracketed by `fsync(file)` before and `fsync(dir)` after, that a crash at any
+one of those boundaries keeps every committed record, and that a torn final
+record is recoverable when cut at any byte, including mid-codepoint. What it
+cannot cover is whether `fsync` reaches the medium, which is the subject of the
+[Durability](#durability) section.
 
 Python has no MC/DC tooling. `coverage.py` gives statement and branch coverage;
 with short-circuit `and`/`or` neither tells you whether an individual
