@@ -1,0 +1,32 @@
+# Version and changelog are derived from commit messages by commitizen.
+#
+# Config lives here rather than in a pyproject.toml because datafile is a single
+# self-contained script, not a packaged distribution. Adding packaging metadata
+# just to hold this config would misrepresent what the repo is.
+#
+# Do not hand-edit CHANGELOG.md or any version string below: `cz bump` owns all
+# of them and a hand edit is overwritten on the next bump.
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+tag_format = "v$version"
+update_changelog_on_bump = true
+
+# v0.1.0 is the release baseline. History before it predates conventional
+# commits, so there is nothing there for a changelog to report.
+changelog_start_rev = "v0.1.0"
+
+# Plain-ASCII arrow, and [skip ci] because the bump commit only rewrites version
+# strings and CHANGELOG.md. Nothing it touches is covered by lint or the tests,
+# which compare against the imported VERSION constant rather than a literal.
+bump_message = "bump: version $current_version -> $new_version [skip ci]"
+
+# VERSION in datafile.py is the runtime source of truth; PI_PACKAGE_VERSION
+# derives from it. package.json holds a committed copy, rewritten in place here
+# rather than by regenerating the pi package, which would bake this machine's
+# absolute paths into the output.
+version_files = [
+    "datafile.py:^VERSION",
+    "pi-datafile/package.json:\"version\"",
+]

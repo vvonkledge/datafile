@@ -5,15 +5,34 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # cz check needs the PR's commits, not just the merge tip.
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+
+      # The version and the changelog are derived from commit messages, so a
+      # non-conventional message contributes nothing to the release and leaves
+      # the bump job with nothing to act on. Caught here rather than after merge,
+      # when the message is no longer cheap to fix.
+      #
+      # Merge commits are exempt by commitizen itself, so the merge-commit PR
+      # flow this repo uses does not need special handling.
+      - name: Commit messages are conventional
+        if: github.event_name == 'pull_request'
+        run: |
+          uvx --from commitizen cz check \
+            --rev-range ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
       - name: Lint
         run: uvx ruff check .
@@ -23,7 +42,8 @@ jobs:
 
       # datafile.py generates its agent skill from the argparse tree, so adding
       # a command silently stales it. The skill carries no machine-specific
-      # paths, so this check is portable.
+      # paths, so this check is portable. It carries no version string either,
+      # so a bump cannot stale it.
       #
       # `pi-package --check` is deliberately NOT run here: pi-package bakes the
       # generating machine's absolute path into README.md and
@@ -31,3 +51,40 @@ jobs:
       # pass on the machine that generated it. Verified failing on linux.
       - name: Generated skill is current
         run: uv run datafile.py skill --check --scope project --app pi
+
+  # Bumps the version, writes CHANGELOG.md, tags, and pushes back to main.
+  # Pushes made with GITHUB_TOKEN do not trigger workflows, and the bump message
+  # carries [skip ci], so this cannot retrigger itself.
+  bump:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # cz reads tags to find the last release and the changelog range.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Bump version and changelog
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          set +e
+          uvx --from commitizen cz bump --yes
+          rc=$?
+          set -e
+
+          case $rc in
+            0)  git push --follow-tags ;;
+            # NO_COMMITS_TO_BUMP. Normal for a docs-only or chore-only push, not
+            # a failure: there is simply no releasable change since the last tag.
+            21) echo "no releasable commits since the last tag" ;;
+            *)  exit $rc ;;
+          esac
