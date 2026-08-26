@@ -1947,7 +1947,16 @@ def cmd_pi_package(args) -> int:
         raise AxiError("uv not found on PATH", "SETUP_ERROR",
                        ["Install uv, then re-run `datafile.py pi-package`"], 1)
     root = args.out or PI_PACKAGE_DIR
-    files = _pi_files(_hook_argv(uv, os.path.abspath(__file__)))
+    # Deliberately not _hook_argv: that prefers a bare PATH alias, which is
+    # right for a hook but wrong here, because CANDIDATES[0] already is the
+    # bare name. Reusing it collapsed the package to [["datafile"],
+    # ["datafile"]] once the script was symlinked onto PATH, leaving a machine
+    # without datafile on PATH no fallback at all.
+    #
+    # realpath, not abspath: invoked through that symlink, __file__ is the
+    # symlink, so the two spellings of the same install baked different paths
+    # and --check reported drift against itself.
+    files = _pi_files([uv, "run", os.path.realpath(__file__)])
 
     stale = []
     for rel, want in files.items():

@@ -1652,6 +1652,29 @@ class TestPiPackage:
         assert 'pi.on("session_start"' in ts
         assert 'pi.on("before_agent_start"' in ts
 
+    def test_package_does_not_depend_on_the_generating_path(self, workspace, cli,
+                                                            monkeypatch):
+        """Regression: `just install` collapsed the fallback to a second bare name.
+
+        The absolute entry is the only thing a machine without datafile on PATH
+        can fall back to, so what gets generated must not depend on whether the
+        generating machine happens to have the script symlinked onto PATH.
+        """
+        ext = Path(store.PI_PACKAGE_DIR, "extensions", "ambient-context.ts")
+        readme = Path(store.PI_PACKAGE_DIR, "README.md")
+
+        # Both states are forced. Reading the real machine's PATH for either one
+        # makes the test pass for the wrong reason on whichever machine already
+        # matches it.
+        monkeypatch.setattr(store, "_path_alias", lambda me: None)
+        cli("pi-package")
+        off = (ext.read_text(), readme.read_text())
+
+        monkeypatch.setattr(store, "_path_alias", lambda me: store.TOOL_NAME)
+        cli("pi-package")
+
+        assert (ext.read_text(), readme.read_text()) == off
+
     def test_readme_has_no_absolute_paths_from_cwd(self, workspace, cli):
         """It must be byte-identical wherever generated, or --check is flaky."""
         cli("pi-package")
