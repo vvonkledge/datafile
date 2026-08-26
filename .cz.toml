@@ -11,6 +11,12 @@
 name = "cz_conventional_commits"
 version = "0.1.0"
 tag_format = "v$version"
+
+# cz tags lightweight by default, but `git push --follow-tags` only pushes
+# annotated tags, so the release tag would never reach origin and the release
+# job would publish a tag that exists nowhere but the runner. An annotated tag
+# also carries a tagger and a date, which is what a release tag should have.
+annotated_tag = true
 update_changelog_on_bump = true
 
 # v0.1.0 is the release baseline. History before it predates conventional

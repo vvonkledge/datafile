@@ -52,7 +52,8 @@ jobs:
       - name: Generated skill is current
         run: uv run datafile.py skill --check --scope project --app pi
 
-  # Bumps the version, writes CHANGELOG.md, tags, and pushes back to main.
+  # Bumps the version, writes CHANGELOG.md, tags, pushes back to main, and
+  # publishes the tag as a GitHub release.
   # Pushes made with GITHUB_TOKEN do not trigger workflows, and the bump message
   # carries [skip ci], so this cannot retrigger itself.
   bump:
@@ -71,7 +72,9 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Bump version and changelog
+      - name: Bump, tag, and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -82,9 +85,18 @@ jobs:
           set -e
 
           case $rc in
-            0)  git push --follow-tags ;;
+            0)  ;;
             # NO_COMMITS_TO_BUMP. Normal for a docs-only or chore-only push, not
             # a failure: there is simply no releasable change since the last tag.
-            21) echo "no releasable commits since the last tag" ;;
+            21) echo "no releasable commits since the last tag"; exit 0 ;;
             *)  exit $rc ;;
           esac
+
+          git push --follow-tags
+
+          # A pushed tag is invisible on the releases page until something
+          # publishes it. The body is the section cz just wrote for this version,
+          # so the release and CHANGELOG.md cannot disagree.
+          tag="v$(uvx --from commitizen cz version --project)"
+          uvx --from commitizen cz changelog --dry-run "$tag" > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md"
