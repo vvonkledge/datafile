@@ -998,19 +998,28 @@ def _get_json(args, s: Store, key: str) -> int:
     lines of that snapshot, and neither is knowable from a single seek."""
     rev, alive, bad = s.snapshot()
     record = alive.get(args.id)
+    # A miss is an answer about the store, not a failure to read it, so it
+    # carries the same envelope as a hit: the revision it was decided against,
+    # and every bad line in that snapshot. Reporting absence with the error
+    # alone would hide corruption exactly when it matters most - the line the
+    # consumer asked for may be one of the unreadable ones, and "not found"
+    # would let it read that as "not there". `record: null` says which of the
+    # two it is; the error and the exit code stay what `get` has always used.
+    envelope = {"revision": rev._asdict(),
+                "record": _json_record(record, None) if record is not None else None,
+                "bad_lines": _json_bad_lines(bad)}
     if record is None:
-        raise _not_found(args, key)
-    emit({"revision": rev._asdict(),
-          "record": _json_record(record, None),
-          "bad_lines": _json_bad_lines(bad)})
+        raise _not_found(args, key, envelope)
+    emit(envelope)
     return 0
 
 
-def _not_found(args, key: str) -> AxiError:
+def _not_found(args, key: str, extra: dict | None = None) -> AxiError:
     """Shared so `get` and `get --json` cannot drift on what missing means or
-    on what it exits with; only the encoding of this payload differs."""
+    on what it exits with; only the encoding and the JSON envelope differ."""
     return AxiError(f"no record with {key} {args.id!r} in {args.file}", "NOT_FOUND",
-                    [f"Run `datafile.py -f {args.file} list` to see available ids"], 1)
+                    [f"Run `datafile.py -f {args.file} list` to see available ids"],
+                    1, extra)
 
 
 def cmd_list(args) -> int:
@@ -1831,7 +1840,9 @@ def render_skill() -> str:
         "of every live record untruncated, the `revision` (inode, size, mtime_ns)",
         "of the store snapshot they were folded from, and a `bad_lines` entry for",
         "every unreadable line. Failures stay JSON in that mode, with the same",
-        "exit codes.",
+        "exit codes: `get --json` for an id that is not there exits 1 and still",
+        "returns that document, `record` null beside the revision and the bad",
+        "lines, so corruption stays visible when the id you asked for is not.",
         "",
         "| exit | meaning |",
         "| --- | --- |",

@@ -853,6 +853,35 @@ class TestJsonBoundary:
         assert doc["code"] == "NOT_FOUND" and "nobody" in doc["error"]
         assert doc["help"]
 
+    def test_a_miss_answers_with_the_whole_envelope(self, workspace, cli):
+        """Absence is an answer about a snapshot, so it carries that snapshot:
+        a consumer must not have to choose between knowing the id is absent and
+        knowing the store is damaged."""
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        code, doc = self.run(cli, "-f", "u.jsonl", "get", "nobody", "--json")
+        _, many = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert code == 1
+        assert doc["record"] is None                      # absent, and it says so
+        assert doc["revision"] == many["revision"]
+        assert doc["bad_lines"] == many["bad_lines"] != []
+        assert list(doc) == ["error", "code", "revision", "record", "bad_lines",
+                             "help"]
+
+    def test_a_miss_in_toon_mode_is_unchanged(self, workspace, cli):
+        """The envelope is the JSON contract's, not `get`'s: TOON says what it
+        always said, with no revision and no null record to read past."""
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        code, out, err = cli("-f", "u.jsonl", "get", "nobody")
+        assert code == 1 and err == ""
+        assert out == ("error: no record with id 'nobody' in u.jsonl\n"
+                       "code: NOT_FOUND\n"
+                       "help[1]:\n"
+                       "  Run `datafile.py -f u.jsonl list` to see available ids\n")
+
     def test_usage_errors_are_json_too(self, workspace, cli):
         self.seed(cli, rec())
         code, doc = self.run(cli, "-f", "u.jsonl", "list", "--json", "--fields", "nope")

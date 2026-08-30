@@ -191,7 +191,9 @@ a program that has to parse the output rather than read it: every field
 of every live record untruncated, the `revision` (inode, size, mtime_ns)
 of the store snapshot they were folded from, and a `bad_lines` entry for
 every unreadable line. Failures stay JSON in that mode, with the same
-exit codes.
+exit codes: `get --json` for an id that is not there exits 1 and still
+returns that document, `record` null beside the revision and the bad
+lines, so corruption stays visible when the id you asked for is not.
 
 | exit | meaning |
 | --- | --- |

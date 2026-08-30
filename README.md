@@ -254,15 +254,26 @@ appear here, with the `offset` and `line` to find them at.
 `--fields` and `--limit` behave as they do in TOON mode, over the same order.
 Unlike TOON mode, `--json` returns every field and never truncates a value, so
 `--full` adds nothing to `get --json`. Failures keep their exit codes and stay
-JSON:
+JSON. An id that is not there exits 1 and still answers with the whole envelope,
+`record` explicitly null:
 
 ```json
 {
   "error": "no record with id 'nobody' in users.jsonl",
   "code": "NOT_FOUND",
+  "revision": {"inode": 10392462, "size": 572, "mtime_ns": 1788083736341297500},
+  "record": null,
+  "bad_lines": [
+    {"offset": 531, "line": 6, "reason": "invalid json: Expecting property name enclosed in double quotes at col 2", "raw": "{bad\n"}
+  ],
   "help": ["Run `datafile.py -f users.jsonl list` to see available ids"]
 }
 ```
+
+That is the one failure that carries the envelope, and it has to: the line the
+consumer asked for may be one of the unreadable ones, and an error on its own
+would let it read "damaged" as "not there". Every other failure is the error
+alone, because no snapshot was folded to describe.
 
 The cost of the guarantees is that `--json` folds the whole log, where TOON
 `list` pages the offset index: `bad_lines` can only be complete for a reader
@@ -468,7 +479,7 @@ defends against, and only power-loss testing on real hardware would settle it.
 ## Development
 
 ```sh
-uv run test_datafile.py                                          # 306 tests
+uv run test_datafile.py                                          # 308 tests
 uv run test_datafile.py --cov=. --cov-branch --cov-report=term-missing
 datafile.py skill --check && datafile.py pi-package --check      # drift gates
 ```
