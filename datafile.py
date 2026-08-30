@@ -55,6 +55,18 @@ class BadLine(NamedTuple):
     raw: str
 
 
+class Revision(NamedTuple):
+    """Which physical state of the log a read was taken from.
+
+    Every append moves size and mtime; compaction rewrites the log through a
+    temp file and a rename, so the inode changes even when the folded records
+    do not. The three together name a snapshot, which is what a consumer needs
+    to tell "nothing has changed" from "I read an older store"."""
+    inode: int | None    # None when the log does not exist yet
+    size: int
+    mtime_ns: int | None
+
+
 class Store(Generic[M]):
     def __init__(self, path: str, model: type[M], key: str = "id"):
         if key not in model.model_fields:
@@ -270,6 +282,25 @@ class Store(Generic[M]):
                 bad.append(BadLine(off, ln, f"contract violation: {detail}",
                                    json.dumps(rec)))
         return alive, bad
+
+    def snapshot(self) -> tuple[Revision, dict[str, M], list[BadLine]]:
+        """One fold, plus the revision of the bytes it folded.
+
+        Taking the stat inside the same shared lock as the fold is the whole
+        point: a writer cannot append or compact between the two, so these
+        records can never be labelled with a revision they did not come from.
+        This is the single read behind `list --json` and `get --json`."""
+        with self._lock(shared=True):
+            rev = self._revision_unlocked()
+            alive, bad = self._load_unlocked()
+            return rev, alive, bad
+
+    def _revision_unlocked(self) -> Revision:
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return Revision(None, 0, None)      # an absent log is a real state
+        return Revision(st.st_ino, st.st_size, st.st_mtime_ns)
 
     # ------------------------------------------------------------ maintenance
 
@@ -682,6 +713,9 @@ DESCRIPTION = "Append-only JSONL record store with a runtime YAML contract"
 # The name this was invoked as, so suggested commands are runnable as typed.
 # Set in main(); importing this module must not pick up the importer's argv[0].
 PROG = "datafile.py"
+# Which encoder emit() uses. Set in main() from `--json`, which only `list` and
+# `get` accept; every other command is TOON-only, as is a bare `datafile.py`.
+JSON_OUTPUT = False
 DETAIL_TRUNCATE = 800     # §3
 CELL_TRUNCATE = 80
 DEFAULT_LIMIT = 100       # §2: high enough to cover common cases in one call
@@ -700,9 +734,16 @@ def emit(payload: dict) -> None:
 
     Suggestions are authored against `datafile.py`; rewrite them to whatever name
     this was invoked as, so §9's "every suggestion is a complete command" holds
-    for a globally installed alias too."""
+    for a globally installed alias too.
+
+    Under `--json` the same payload is encoded as JSON instead of TOON, errors
+    included, so a caller that asked for JSON never has to parse two formats to
+    find out that its request failed."""
     if PROG != "datafile.py" and isinstance(payload.get("help"), list):
         payload["help"] = [h.replace("datafile.py", PROG) for h in payload["help"]]
+    if JSON_OUTPUT:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
     text = toon(payload)
     if text:
         print(text)
@@ -906,9 +947,76 @@ def _default_fields(model, key: str) -> list[str]:
     return [key, *(req + opt)[:3]]
 
 
+# ------------------------------------------------- the JSON boundary (public)
+# `--json` is a supported machine contract, not a rendering option, so the two
+# encoders differ in more than shape and the differences are all here:
+#
+#   TOON                                  JSON
+#   paged through the offset index        one full fold under one read lock
+#   a count of unreadable lines           every unreadable line, in full
+#   key + first three fields by default   every field of every record
+#   values clipped to a cell width        canonical values, never clipped
+#   no revision                           the revision the fold came from
+#
+# The clipping and the default field set are token economy for a human or an
+# agent reading a table; both would corrupt a value a program is going to act
+# on. The full fold is what buys the other two guarantees: bad lines can only
+# be reported line by line by a reader that saw every line, and a revision is
+# only honest about a set of records if it was stat'd under the lock that
+# produced them.
+
+
+def _json_bad_lines(bad: list[BadLine]) -> list[dict]:
+    """Corruption is data, not a footnote: every unreadable line is reported
+    with where it is and what is wrong with it, so a consumer can never mistake
+    a damaged store for a smaller clean one."""
+    return [b._asdict() for b in bad]
+
+
+def _json_record(record, fields: list[str] | None) -> dict:
+    """Pydantic's JSON mode, so every contract type lands on its standard JSON
+    encoding: ISO-8601 for datetime/date/time, a string for uuid and email, the
+    bare value for an enum, native arrays and objects for list and dict, and
+    null for an absent optional. Nothing is re-encoded as a string."""
+    d = record.model_dump(mode="json")
+    return {f: d[f] for f in fields} if fields else d
+
+
+def _list_json(args, s: Store, fields: list[str] | None) -> int:
+    rev, alive, bad = s.snapshot()
+    live = list(alive.values())          # insertion order, as the TOON page is
+    shown = live[:args.limit] if args.limit > 0 else []
+    emit({"revision": rev._asdict(),
+          "records": [_json_record(r, fields) for r in shown],
+          "bad_lines": _json_bad_lines(bad)})
+    return 0
+
+
+def _get_json(args, s: Store, key: str) -> int:
+    """The same fold as `list --json`, not `get`'s O(1) index read: one record
+    still has to be labelled with the revision it came from and carry the bad
+    lines of that snapshot, and neither is knowable from a single seek."""
+    rev, alive, bad = s.snapshot()
+    record = alive.get(args.id)
+    if record is None:
+        raise _not_found(args, key)
+    emit({"revision": rev._asdict(),
+          "record": _json_record(record, None),
+          "bad_lines": _json_bad_lines(bad)})
+    return 0
+
+
+def _not_found(args, key: str) -> AxiError:
+    """Shared so `get` and `get --json` cannot drift on what missing means or
+    on what it exits with; only the encoding of this payload differs."""
+    return AxiError(f"no record with {key} {args.id!r} in {args.file}", "NOT_FOUND",
+                    [f"Run `datafile.py -f {args.file} list` to see available ids"], 1)
+
+
 def cmd_list(args) -> int:
     s, model, key = _open(args)
 
+    fields = None
     if args.fields:                          # a usage error should not read the log
         fields = [f.strip() for f in args.fields.split(",") if f.strip()]
         unknown = [f for f in fields if f not in model.model_fields]
@@ -916,9 +1024,11 @@ def cmd_list(args) -> int:
             raise AxiError(
                 f"unknown field(s) {unknown} for this contract", "USAGE_ERROR",
                 [f"Valid fields: {', '.join(model.model_fields)}"], 2)
-    else:
-        fields = _default_fields(model, key)
 
+    if args.json:
+        return _list_json(args, s, fields)
+
+    fields = fields or _default_fields(model, key)
     shown, total, bad = s.page(args.limit)
 
     if not total:                                          # §5
@@ -966,10 +1076,11 @@ def cmd_list(args) -> int:
 
 def cmd_get(args) -> int:
     s, _model, key = _open(args)
+    if args.json:
+        return _get_json(args, s, key)
     rec = s.get(args.id)
     if rec is None:
-        raise AxiError(f"no record with {key} {args.id!r} in {args.file}", "NOT_FOUND",
-                       [f"Run `datafile.py -f {args.file} list` to see available ids"], 1)
+        raise _not_found(args, key)
     d = rec.model_dump(mode="json")
     truncated = []
     if not args.full:
@@ -1715,6 +1826,13 @@ def render_skill() -> str:
         "Output is TOON on stdout, including errors, which carry a `code:` and",
         "`help:` suggestions. Nothing is written to stderr.",
         "",
+        "`list --json` and `get --json` swap TOON for a single JSON document, for",
+        "a program that has to parse the output rather than read it: every field",
+        "of every live record untruncated, the `revision` (inode, size, mtime_ns)",
+        "of the store snapshot they were folded from, and a `bad_lines` entry for",
+        "every unreadable line. Failures stay JSON in that mode, with the same",
+        "exit codes.",
+        "",
         "| exit | meaning |",
         "| --- | --- |",
         "| 0 | success, including idempotent no-ops |",
@@ -2015,17 +2133,25 @@ def build_parser() -> tuple[AxiParser, dict]:
 
     sp = add("get", "read one record",
              "examples:\n  datafile.py -f u.jsonl get a1\n"
-             "  datafile.py -f u.jsonl get a1 --full")
+             "  datafile.py -f u.jsonl get a1 --full\n"
+             "  datafile.py -f u.jsonl get a1 --json")
     sp.add_argument("id")
     sp.add_argument("--full", action="store_true",
                     help=f"do not truncate values (default: {DETAIL_TRUNCATE} chars)")
+    sp.add_argument("--json", action="store_true",
+                    help="emit one JSON document: revision, record, bad_lines "
+                         "(never truncated, so --full is redundant)")
 
     sp = add("list", "list records",
              "examples:\n  datafile.py -f u.jsonl list\n"
-             "  datafile.py -f u.jsonl list --fields id,name,age --limit 500")
+             "  datafile.py -f u.jsonl list --fields id,name,age --limit 500\n"
+             "  datafile.py -f u.jsonl list --json")
     sp.add_argument("--fields", help="comma-separated fields (default: key + first 3)")
     sp.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                     help=f"max records (default: {DEFAULT_LIMIT})")
+    sp.add_argument("--json", action="store_true",
+                    help="emit one JSON document: revision, records, bad_lines "
+                         "(every field, untruncated, unless --fields narrows it)")
 
     sp = add("keys", "list record ids only",
              "examples:\n  datafile.py -f u.jsonl keys\n"
@@ -2119,7 +2245,8 @@ COMMANDS = {"put": cmd_put, "get": cmd_get, "list": cmd_list, "keys": cmd_keys,
 
 
 def main(argv=None) -> int:
-    global PROG
+    global PROG, JSON_OUTPUT
+    JSON_OUTPUT = False          # never inherited from an earlier in-process call
     if argv is None:
         PROG = os.path.basename(sys.argv[0]) or "datafile.py"
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -2132,6 +2259,10 @@ def main(argv=None) -> int:
             args = parser.parse_args(argv)
         except _Usage as u:
             cmd = next((a for a in argv if a in subs), None)
+            # The parse failed, so there is no args.json to read; a caller that
+            # asked for JSON still gets JSON, or its parser chokes on the one
+            # output it cannot handle - the one telling it what it got wrong.
+            JSON_OUTPUT = cmd in ("list", "get") and "--json" in argv
             valid = [*_flags_of(subs[cmd]), "--file", "--contract"] if cmd \
                 else _flags_of(parser)
             raise AxiError(
@@ -2139,6 +2270,8 @@ def main(argv=None) -> int:
                 [f"valid flags for `{cmd or PROG}`: {', '.join(sorted(set(valid)))}",
                  f"Run `{PROG} {cmd or ''} --help` for the full reference".replace("  ", " ")],
                 2) from None
+
+        JSON_OUTPUT = getattr(args, "json", False)   # only list and get carry it
 
         if args.version:
             print(VERSION)
