@@ -468,7 +468,7 @@ defends against, and only power-loss testing on real hardware would settle it.
 ## Development
 
 ```sh
-uv run test_datafile.py                                          # 287 tests
+uv run test_datafile.py                                          # 306 tests
 uv run test_datafile.py --cov=. --cov-branch --cov-report=term-missing
 datafile.py skill --check && datafile.py pi-package --check      # drift gates
 ```

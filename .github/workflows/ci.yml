@@ -50,13 +50,17 @@ jobs:
       # a command silently stales it. The skill carries no machine-specific
       # paths, so this check is portable. It carries no version string either,
       # so a bump cannot stale it.
-      #
-      # `pi-package --check` is deliberately NOT run here: pi-package bakes the
-      # generating machine's absolute path into README.md and
-      # extensions/ambient-context.ts as a PATH fallback, so the check can only
-      # pass on the machine that generated it. Verified failing on linux.
       - name: Generated skill is current
         run: uv run datafile.py skill --check --scope project --app pi
+
+      # The pi package bundles that same skill, so it stales for the same
+      # reason. It used to bake the generating machine's absolute path in as a
+      # PATH fallback, which is why this gate was not run here; it resolves
+      # `datafile` from PATH at runtime instead, so its output is now identical
+      # in every checkout. It does carry the version, but the bump commit
+      # rewrites that copy alongside VERSION, so a release cannot stale it.
+      - name: Generated pi package is current
+        run: uv run datafile.py pi-package --check
 
   # Bumps the version, writes CHANGELOG.md, tags, pushes back to main, and
   # publishes the tag as a GitHub release.

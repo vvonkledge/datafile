@@ -30,8 +30,8 @@ bump_message = "bump: version $current_version -> $new_version [skip ci]"
 
 # VERSION in datafile.py is the runtime source of truth; PI_PACKAGE_VERSION
 # derives from it. package.json holds a committed copy, rewritten in place here
-# rather than by regenerating the pi package, which would bake this machine's
-# absolute paths into the output.
+# rather than by regenerating the pi package, because cz bumps without running
+# the tool. Both spellings produce the same bytes, and CI checks that they do.
 version_files = [
     "datafile.py:^VERSION",
     "pi-datafile/package.json:\"version\"",

@@ -10,7 +10,6 @@ import importlib.util
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import textwrap
@@ -1834,46 +1833,30 @@ class TestPiPackage:
         p = Path(store.PI_PACKAGE_DIR, "skills", store.SKILL_NAME, "SKILL.md")
         assert p.exists() and p.parent.name == store.SKILL_NAME
 
-    def test_extension_prefers_path_then_absolute(self, workspace, cli):
+    def test_extension_resolves_the_command_at_runtime(self, workspace, cli):
         cli("pi-package")
         ts = Path(store.PI_PACKAGE_DIR, "extensions",
                   "ambient-context.ts").read_text()
-        m = re.search(r"const CANDIDATES: string\[\]\[\] = (\[.*?\]);", ts, re.S)
-        candidates = json.loads(m.group(1))
-        assert candidates[0] == [store.TOOL_NAME]
-        assert candidates[1][-1].endswith("datafile.py")
+        assert f'const COMMAND = "{store.TOOL_NAME}";' in ts
         assert 'pi.on("session_start"' in ts
         assert 'pi.on("before_agent_start"' in ts
+        # A missing command is reported, not routed to a second candidate: the
+        # only other candidate there could be is a path from another machine.
+        assert "CANDIDATES" not in ts
+        assert "console.error(NOT_INSTALLED)" in ts
+        assert "could not run" in ts and "just install" in ts
 
-    def test_package_does_not_depend_on_the_generating_path(self, workspace, cli,
-                                                            monkeypatch):
-        """Regression: `just install` collapsed the fallback to a second bare name.
-
-        The absolute entry is the only thing a machine without datafile on PATH
-        can fall back to, so what gets generated must not depend on whether the
-        generating machine happens to have the script symlinked onto PATH.
-        """
-        ext = Path(store.PI_PACKAGE_DIR, "extensions", "ambient-context.ts")
-        readme = Path(store.PI_PACKAGE_DIR, "README.md")
-
-        # Both states are forced. Reading the real machine's PATH for either one
-        # makes the test pass for the wrong reason on whichever machine already
-        # matches it.
-        monkeypatch.setattr(store, "_path_alias", lambda me: None)
+    def test_no_generated_file_carries_a_source_path(self, workspace, cli):
+        """Byte-identical output everywhere is what makes `--check` a real gate,
+        and one leaked path is enough to lose it."""
         cli("pi-package")
-        off = (ext.read_text(), readme.read_text())
-
-        monkeypatch.setattr(store, "_path_alias", lambda me: store.TOOL_NAME)
-        cli("pi-package")
-
-        assert (ext.read_text(), readme.read_text()) == off
-
-    def test_readme_has_no_absolute_paths_from_cwd(self, workspace, cli):
-        """It must be byte-identical wherever generated, or --check is flaky."""
-        cli("pi-package")
-        text = Path(store.PI_PACKAGE_DIR, "README.md").read_text()
-        assert str(workspace) not in text
-        assert "/path/to/" in text
+        root = Path(store.PI_PACKAGE_DIR)
+        for f in root.rglob("*"):
+            if f.is_file():
+                text = f.read_text()
+                assert str(workspace) not in text
+                assert str(store.__file__) not in text
+        assert "/path/to/" in (root / "README.md").read_text()
 
     def test_check_clean_stale_and_missing(self, workspace, cli):
         code, out, _ = cli("pi-package", "--check")
@@ -1901,11 +1884,55 @@ class TestPiPackage:
         assert Path("dist/pi/package.json").exists()
         assert not Path(store.PI_PACKAGE_DIR).exists()
 
-    def test_uv_missing_is_setup_error(self, workspace, cli, monkeypatch):
+    def test_generation_needs_nothing_from_the_machine(self, workspace, cli,
+                                                       monkeypatch):
+        """Regression: generation used to fail without `uv`, because it baked
+        `uv run <this checkout>` in as a fallback. Nothing from this machine
+        reaches the output any more, so nothing about it can block a build."""
         import shutil
         monkeypatch.setattr(shutil, "which", lambda n: None)
-        code, out, _ = cli("pi-package")
-        assert code == 1 and "uv not found" in out
+        assert cli("pi-package")[0] == 0
+
+    def test_two_source_roots_generate_identical_bytes(self, tmp_path):
+        """The end-to-end property `pi-package --check` rests on: one commit,
+        generated from two different absolute paths, is the same bytes.
+
+        Run out of process from a real copy of the script in each root, because
+        the leak this replaces came from `__file__`, and an in-process import
+        would keep pointing at this checkout however the test moved.
+        """
+        import shutil
+        generated = []
+        for name in ("root-a", "a-much-longer-root-b"):
+            root = tmp_path / name
+            root.mkdir()
+            shutil.copy(DATAFILE_PY, root / "datafile.py")
+            r = subprocess.run([sys.executable, str(root / "datafile.py"),
+                                "pi-package"],
+                               cwd=root, capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            pkg = root / store.PI_PACKAGE_DIR
+            files = {str(f.relative_to(pkg)): f.read_text()
+                     for f in pkg.rglob("*") if f.is_file()}
+            assert set(files) == {f.replace("/", os.sep) for f in self.FILES}
+            for text in files.values():
+                assert str(root) not in text
+            generated.append(files)
+        assert generated[0] == generated[1]
+
+    def test_committed_package_checks_clean_from_another_root(self, tmp_path):
+        """What CI and a fresh worktree do: check the committed artifacts from
+        a path that never generated them, without regenerating first."""
+        import shutil
+        root = tmp_path / "elsewhere"
+        root.mkdir()
+        shutil.copy(DATAFILE_PY, root / "datafile.py")
+        shutil.copytree(HERE / store.PI_PACKAGE_DIR, root / store.PI_PACKAGE_DIR)
+        r = subprocess.run([sys.executable, str(root / "datafile.py"),
+                            "pi-package", "--check"],
+                           cwd=root, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "up to date" in r.stdout
 
 
 # ------------------------------------------------------------ roll (archiving)
