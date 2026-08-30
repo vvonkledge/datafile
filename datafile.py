@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 # AXI §10 fast path: -v/-V/--version must answer before pydantic and yaml are
 # imported, so a version probe costs interpreter startup and nothing else.
