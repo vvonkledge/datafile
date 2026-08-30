@@ -486,11 +486,12 @@ check, or an off-by-one, and a specifically named test fails. If you change
 behaviour in those areas, expect to update a named test and be sure you meant
 to.
 
-`.github/workflows/ci.yml` runs the commit message gate, lint, tests, and the
-skill drift gate, then releases from `main` (section 10). Note that
-`pi-package --check` is deliberately **not** in CI: it bakes the generating
-machine's absolute paths into its output, so it can only pass on the machine
-that generated it.
+`.github/workflows/ci.yml` runs the commit message gate, lint, tests, and both
+drift gates, then releases from `main` (section 10). Both gates are portable:
+neither the skill nor the pi package carries a path from the machine that
+generated it, so the same commit checks clean in any checkout. The pi package
+does carry the version, but `cz bump` rewrites it in the same commit that bumps
+`VERSION`, so a release cannot stale it either.
 
 The whole tool is one file, `datafile.py`. Section markers (`§8` and similar) in
 its comments refer to the design sections.

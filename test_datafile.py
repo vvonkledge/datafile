@@ -10,7 +10,6 @@ import importlib.util
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import textwrap
@@ -672,6 +671,228 @@ class TestCLI:
         monkeypatch.setattr(store, "PROG", "datafile")
         _, out, _ = cli("-f", "users.jsonl", "get", "nobody")
         assert "Run `datafile " in out and "datafile.py" not in out
+
+
+# -------------------------------------------------- public JSON boundary (§6)
+# `--json` is a published CLI contract, so these tests assert the shapes
+# themselves and not just that something came out. A change that breaks one of
+# them breaks every consumer reading this store without importing Store.
+
+RICH_CONTRACT = textwrap.dedent("""
+    name: Thing
+    key: id
+    extra: forbid
+    fields:
+      id:   {type: str}
+      when: {type: datetime}
+      day:  {type: date}
+      at:   {type: time}
+      uid:  {type: uuid}
+      mail: {type: email, required: false}
+      role: {type: enum, values: [admin, member], default: member}
+      tags: {type: list, items: int, default: []}
+      meta: {type: dict, required: false}
+""")
+
+RICH_RECORD = {
+    "id": "a1", "when": "2026-08-30T10:11:12+02:00", "day": "2026-08-30",
+    "at": "10:11:12", "uid": "6f5902ac-2373-4c14-a1a1-8b8b1b2c3d4e",
+    "tags": [1, 2], "meta": {"k": [1, {"z": None}]},
+}
+
+
+class TestJsonBoundary:
+    @staticmethod
+    def run(cli, *argv):
+        """Whatever the exit code, stdout must be exactly one JSON document and
+        stderr must stay empty."""
+        code, out, err = cli(*argv)
+        assert err == ""
+        return code, json.loads(out)
+
+    @staticmethod
+    def seed(cli, *records):
+        for r in records:
+            assert cli("-f", "u.jsonl", "put", r)[0] == 0
+
+    # ----------------------------------------------------- the TOON path is untouched
+
+    def test_toon_is_unchanged_when_the_flag_is_absent(self, workspace, cli):
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        _, out, _ = cli("-f", "u.jsonl", "list")
+        assert out.startswith("count: 1 of 1 total")
+        assert "bad: 1" in out and "bad_lines" not in out
+
+    def test_json_mode_does_not_leak_into_the_next_command(self, workspace, cli):
+        self.seed(cli, rec())
+        assert self.run(cli, "-f", "u.jsonl", "list", "--json")[0] == 0
+        _, out, _ = cli("-f", "u.jsonl", "list")
+        assert out.startswith("count: ")
+
+    # ------------------------------------------------------------------ the fold
+
+    def test_update_and_tombstone_are_folded_exactly_once(self, workspace, cli):
+        self.seed(cli, rec(), rec(name="Ada L"), rec(id="bob"), rec(id="cy"))
+        assert cli("-f", "u.jsonl", "delete", "bob")[0] == 0
+        code, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert code == 0
+        assert [r["id"] for r in doc["records"]] == ["ada", "cy"]
+        assert doc["records"][0]["name"] == "Ada L"
+
+    def test_defaults_materialise_for_a_record_older_than_the_field(self, workspace, cli):
+        # Written before `role` and `tags` were added to the contract: the fold
+        # materialises them, so a consumer never sees a half-shaped record.
+        Path("u.jsonl").write_text('{"id":"ada","name":"Ada","age":36,"note":"n"}\n')
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert doc["records"][0]["role"] == "member"
+        assert doc["records"][0]["tags"] == []
+
+    def test_list_order_and_limit_match_the_toon_page(self, workspace, cli):
+        self.seed(cli, *(rec(id=f"u{i}") for i in range(3)))
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json", "--limit", "2")
+        assert [r["id"] for r in doc["records"]] == ["u0", "u1"]
+        assert self.run(cli, "-f", "u.jsonl", "list", "--json", "--limit", "0")[1]["records"] == []
+
+    def test_fields_narrows_and_the_default_is_every_field(self, workspace, cli):
+        self.seed(cli, rec())
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json", "--fields", "id,role")
+        assert list(doc["records"][0]) == ["id", "role"]
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert set(doc["records"][0]) == {"id", "name", "age", "email", "role", "tags", "note"}
+
+    def test_values_are_never_truncated(self, workspace, cli):
+        self.seed(cli, rec(note="x" * 3000))
+        _, doc = self.run(cli, "-f", "u.jsonl", "get", "ada", "--json")
+        assert doc["record"]["note"] == "x" * 3000
+        assert "truncated" not in doc
+
+    # ------------------------------------------------------------------- bad lines
+
+    def test_every_unreadable_line_is_reported(self, workspace, cli):
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")                                    # invalid json
+            f.write('{"id":"dee","name":"D","age":999,"note":"n"}\n')  # off contract
+            f.write('{"id":"torn"')                              # torn tail
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert len(doc["records"]) == 1                          # still readable
+        reasons = [b["reason"] for b in doc["bad_lines"]]
+        assert len(reasons) == 3
+        assert "invalid json" in reasons[0]
+        assert "contract violation" in reasons[1] and "age" in reasons[1]
+        assert "torn tail" in reasons[2]
+
+    def test_bad_line_shape_is_stable(self, workspace, cli):
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        b = doc["bad_lines"][0]
+        assert set(b) == {"offset", "line", "reason", "raw"}
+        assert b["line"] == 2 and b["offset"] > 0 and b["raw"] == "{bad\n"
+
+    # -------------------------------------------------------------------- revision
+
+    def test_revision_identifies_the_file_that_was_read(self, workspace, cli):
+        self.seed(cli, rec())
+        _, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        st = os.stat("u.jsonl")
+        assert set(doc["revision"]) == {"inode", "size", "mtime_ns"}
+        assert doc["revision"] == {"inode": st.st_ino, "size": st.st_size,
+                                   "mtime_ns": st.st_mtime_ns}
+
+    def test_compaction_changes_the_revision_though_the_records_do_not(self, workspace, cli):
+        self.seed(cli, rec(), rec(name="Ada L"))
+        _, before = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert cli("-f", "u.jsonl", "compact")[0] == 0
+        _, after = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert after["records"] == before["records"]
+        assert after["revision"] != before["revision"]
+        assert after["revision"]["inode"] != before["revision"]["inode"]
+
+    def test_absent_store_is_a_revision_not_a_message(self, workspace, cli):
+        code, doc = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert code == 0
+        assert doc == {"revision": {"inode": None, "size": 0, "mtime_ns": None},
+                       "records": [], "bad_lines": []}
+
+    def test_get_reports_the_same_revision_and_bad_lines_as_list(self, workspace, cli):
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        _, one = self.run(cli, "-f", "u.jsonl", "get", "ada", "--json")
+        _, many = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert one["revision"] == many["revision"]
+        assert one["bad_lines"] == many["bad_lines"]
+        assert one["record"] == many["records"][0]
+
+    # ----------------------------------------------------------------- contract types
+
+    def test_every_contract_type_is_json_native(self, workspace, cli):
+        Path("rich.yaml").write_text(RICH_CONTRACT)
+        code, _, _ = cli("-f", "r.jsonl", "-c", "rich.yaml", "put", json.dumps(RICH_RECORD))
+        assert code == 0
+        _, doc = self.run(cli, "-f", "r.jsonl", "-c", "rich.yaml", "get", "a1", "--json")
+        r = doc["record"]
+        assert r["when"] == "2026-08-30T10:11:12+02:00"
+        assert r["day"] == "2026-08-30" and r["at"] == "10:11:12"
+        assert r["uid"] == RICH_RECORD["uid"]
+        assert r["mail"] is None                      # nullable, not omitted
+        assert r["role"] == "member"                  # enum default, bare value
+        assert r["tags"] == [1, 2]                    # a list, not a string
+        assert r["meta"] == {"k": [1, {"z": None}]}   # a dict, not a string
+
+    # --------------------------------------------------------------------- failures
+
+    def test_missing_record_is_a_json_error_with_the_usual_exit(self, workspace, cli):
+        self.seed(cli, rec())
+        code, doc = self.run(cli, "-f", "u.jsonl", "get", "nobody", "--json")
+        assert code == 1
+        assert doc["code"] == "NOT_FOUND" and "nobody" in doc["error"]
+        assert doc["help"]
+
+    def test_a_miss_answers_with_the_whole_envelope(self, workspace, cli):
+        """Absence is an answer about a snapshot, so it carries that snapshot:
+        a consumer must not have to choose between knowing the id is absent and
+        knowing the store is damaged."""
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        code, doc = self.run(cli, "-f", "u.jsonl", "get", "nobody", "--json")
+        _, many = self.run(cli, "-f", "u.jsonl", "list", "--json")
+        assert code == 1
+        assert doc["record"] is None                      # absent, and it says so
+        assert doc["revision"] == many["revision"]
+        assert doc["bad_lines"] == many["bad_lines"] != []
+        assert list(doc) == ["error", "code", "revision", "record", "bad_lines",
+                             "help"]
+
+    def test_a_miss_in_toon_mode_is_unchanged(self, workspace, cli):
+        """The envelope is the JSON contract's, not `get`'s: TOON says what it
+        always said, with no revision and no null record to read past."""
+        self.seed(cli, rec())
+        with open("u.jsonl", "a") as f:
+            f.write("{bad\n")
+        code, out, err = cli("-f", "u.jsonl", "get", "nobody")
+        assert code == 1 and err == ""
+        assert out == ("error: no record with id 'nobody' in u.jsonl\n"
+                       "code: NOT_FOUND\n"
+                       "help[1]:\n"
+                       "  Run `datafile.py -f u.jsonl list` to see available ids\n")
+
+    def test_usage_errors_are_json_too(self, workspace, cli):
+        self.seed(cli, rec())
+        code, doc = self.run(cli, "-f", "u.jsonl", "list", "--json", "--fields", "nope")
+        assert code == 2 and doc["code"] == "USAGE_ERROR"
+        # This one fails in argparse, before there is an args.json to consult.
+        code, doc = self.run(cli, "-f", "u.jsonl", "list", "--json", "--stat", "x")
+        assert code == 2 and doc["code"] == "USAGE_ERROR"
+
+    def test_json_is_not_offered_on_other_commands(self, workspace, cli):
+        code, out, _ = cli("-f", "u.jsonl", "keys", "--json")
+        assert code == 2 and out.startswith("error: ")
 
 
 # ------------------------------------------------------------- discovery (§8)
@@ -1641,46 +1862,30 @@ class TestPiPackage:
         p = Path(store.PI_PACKAGE_DIR, "skills", store.SKILL_NAME, "SKILL.md")
         assert p.exists() and p.parent.name == store.SKILL_NAME
 
-    def test_extension_prefers_path_then_absolute(self, workspace, cli):
+    def test_extension_resolves_the_command_at_runtime(self, workspace, cli):
         cli("pi-package")
         ts = Path(store.PI_PACKAGE_DIR, "extensions",
                   "ambient-context.ts").read_text()
-        m = re.search(r"const CANDIDATES: string\[\]\[\] = (\[.*?\]);", ts, re.S)
-        candidates = json.loads(m.group(1))
-        assert candidates[0] == [store.TOOL_NAME]
-        assert candidates[1][-1].endswith("datafile.py")
+        assert f'const COMMAND = "{store.TOOL_NAME}";' in ts
         assert 'pi.on("session_start"' in ts
         assert 'pi.on("before_agent_start"' in ts
+        # A missing command is reported, not routed to a second candidate: the
+        # only other candidate there could be is a path from another machine.
+        assert "CANDIDATES" not in ts
+        assert "console.error(NOT_INSTALLED)" in ts
+        assert "could not run" in ts and "just install" in ts
 
-    def test_package_does_not_depend_on_the_generating_path(self, workspace, cli,
-                                                            monkeypatch):
-        """Regression: `just install` collapsed the fallback to a second bare name.
-
-        The absolute entry is the only thing a machine without datafile on PATH
-        can fall back to, so what gets generated must not depend on whether the
-        generating machine happens to have the script symlinked onto PATH.
-        """
-        ext = Path(store.PI_PACKAGE_DIR, "extensions", "ambient-context.ts")
-        readme = Path(store.PI_PACKAGE_DIR, "README.md")
-
-        # Both states are forced. Reading the real machine's PATH for either one
-        # makes the test pass for the wrong reason on whichever machine already
-        # matches it.
-        monkeypatch.setattr(store, "_path_alias", lambda me: None)
+    def test_no_generated_file_carries_a_source_path(self, workspace, cli):
+        """Byte-identical output everywhere is what makes `--check` a real gate,
+        and one leaked path is enough to lose it."""
         cli("pi-package")
-        off = (ext.read_text(), readme.read_text())
-
-        monkeypatch.setattr(store, "_path_alias", lambda me: store.TOOL_NAME)
-        cli("pi-package")
-
-        assert (ext.read_text(), readme.read_text()) == off
-
-    def test_readme_has_no_absolute_paths_from_cwd(self, workspace, cli):
-        """It must be byte-identical wherever generated, or --check is flaky."""
-        cli("pi-package")
-        text = Path(store.PI_PACKAGE_DIR, "README.md").read_text()
-        assert str(workspace) not in text
-        assert "/path/to/" in text
+        root = Path(store.PI_PACKAGE_DIR)
+        for f in root.rglob("*"):
+            if f.is_file():
+                text = f.read_text()
+                assert str(workspace) not in text
+                assert str(store.__file__) not in text
+        assert "/path/to/" in (root / "README.md").read_text()
 
     def test_check_clean_stale_and_missing(self, workspace, cli):
         code, out, _ = cli("pi-package", "--check")
@@ -1708,11 +1913,55 @@ class TestPiPackage:
         assert Path("dist/pi/package.json").exists()
         assert not Path(store.PI_PACKAGE_DIR).exists()
 
-    def test_uv_missing_is_setup_error(self, workspace, cli, monkeypatch):
+    def test_generation_needs_nothing_from_the_machine(self, workspace, cli,
+                                                       monkeypatch):
+        """Regression: generation used to fail without `uv`, because it baked
+        `uv run <this checkout>` in as a fallback. Nothing from this machine
+        reaches the output any more, so nothing about it can block a build."""
         import shutil
         monkeypatch.setattr(shutil, "which", lambda n: None)
-        code, out, _ = cli("pi-package")
-        assert code == 1 and "uv not found" in out
+        assert cli("pi-package")[0] == 0
+
+    def test_two_source_roots_generate_identical_bytes(self, tmp_path):
+        """The end-to-end property `pi-package --check` rests on: one commit,
+        generated from two different absolute paths, is the same bytes.
+
+        Run out of process from a real copy of the script in each root, because
+        the leak this replaces came from `__file__`, and an in-process import
+        would keep pointing at this checkout however the test moved.
+        """
+        import shutil
+        generated = []
+        for name in ("root-a", "a-much-longer-root-b"):
+            root = tmp_path / name
+            root.mkdir()
+            shutil.copy(DATAFILE_PY, root / "datafile.py")
+            r = subprocess.run([sys.executable, str(root / "datafile.py"),
+                                "pi-package"],
+                               cwd=root, capture_output=True, text=True)
+            assert r.returncode == 0, r.stdout + r.stderr
+            pkg = root / store.PI_PACKAGE_DIR
+            files = {str(f.relative_to(pkg)): f.read_text()
+                     for f in pkg.rglob("*") if f.is_file()}
+            assert set(files) == {f.replace("/", os.sep) for f in self.FILES}
+            for text in files.values():
+                assert str(root) not in text
+            generated.append(files)
+        assert generated[0] == generated[1]
+
+    def test_committed_package_checks_clean_from_another_root(self, tmp_path):
+        """What CI and a fresh worktree do: check the committed artifacts from
+        a path that never generated them, without regenerating first."""
+        import shutil
+        root = tmp_path / "elsewhere"
+        root.mkdir()
+        shutil.copy(DATAFILE_PY, root / "datafile.py")
+        shutil.copytree(HERE / store.PI_PACKAGE_DIR, root / store.PI_PACKAGE_DIR)
+        r = subprocess.run([sys.executable, str(root / "datafile.py"),
+                            "pi-package", "--check"],
+                           cwd=root, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "up to date" in r.stdout
 
 
 # ------------------------------------------------------------ roll (archiving)

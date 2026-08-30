@@ -36,8 +36,8 @@ the current directory and is the cheapest way to orient.
 | command | purpose | flags |
 | --- | --- | --- |
 | `put` | insert or update records | --set |
-| `get` | read one record | --full |
-| `list` | list records | --fields, --limit (default: 100) |
+| `get` | read one record | --full, --json |
+| `list` | list records | --fields, --limit (default: 100), --json |
 | `keys` | list record ids only | --limit (default: 100) |
 | `stores` | find .jsonl stores and their contracts | --depth (default: 3), --all |
 | `delete` | remove one record | - |
@@ -65,6 +65,7 @@ cat dump.jsonl | datafile.py -f u.jsonl put -
 ```sh
 datafile.py -f u.jsonl get a1
 datafile.py -f u.jsonl get a1 --full
+datafile.py -f u.jsonl get a1 --json
 ```
 
 **list**
@@ -72,6 +73,7 @@ datafile.py -f u.jsonl get a1 --full
 ```sh
 datafile.py -f u.jsonl list
 datafile.py -f u.jsonl list --fields id,name,age --limit 500
+datafile.py -f u.jsonl list --json
 ```
 
 **keys**
@@ -183,6 +185,15 @@ constraints, and keys are rejected when the contract loads.
 
 Output is TOON on stdout, including errors, which carry a `code:` and
 `help:` suggestions. Nothing is written to stderr.
+
+`list --json` and `get --json` swap TOON for a single JSON document, for
+a program that has to parse the output rather than read it: every field
+of every live record untruncated, the `revision` (inode, size, mtime_ns)
+of the store snapshot they were folded from, and a `bad_lines` entry for
+every unreadable line. Failures stay JSON in that mode, with the same
+exit codes: `get --json` for an id that is not there exits 1 and still
+returns that document, `record` null beside the revision and the bad
+lines, so corruption stays visible when the id you asked for is not.
 
 | exit | meaning |
 | --- | --- |

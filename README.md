@@ -164,8 +164,8 @@ contract error: schema.yaml: field 'id': unknown key ['minlength'].
 | --- | --- |
 | *(no arguments)* | list the stores in this directory and how to act on them |
 | `put` | insert or update; accepts JSON, `--set` pairs, or `-` for stdin |
-| `get <id>` | one record, all fields |
-| `list` | records as a table; `--fields`, `--limit` |
+| `get <id>` | one record, all fields; `--full`, `--json` |
+| `list` | records as a table; `--fields`, `--limit`, `--json` |
 | `keys` | ids only; `--limit` |
 | `stores` | find `.jsonl` stores and their contracts; `--depth`, `--all` |
 | `delete <id>` | append a tombstone |
@@ -206,6 +206,78 @@ rejected[1]{id,problem}:
 Mutations are idempotent. Writing a record identical to the stored one reports
 `unchanged` and does not grow the log; deleting an absent record is a no-op with
 exit 0.
+
+## Machine-readable output
+
+`list --json` and `get --json` replace TOON with exactly one JSON document on
+stdout. This is a supported CLI contract: it is how a program reads a store
+without importing anything from `datafile.py` or reimplementing the fold. It is
+unrelated to `schema --json-schema`, which describes the contract, not the data.
+
+```sh
+datafile.py -f users.jsonl list --json
+```
+
+```json
+{
+  "revision": {"inode": 10392462, "size": 572, "mtime_ns": 1788083736341297500},
+  "records": [
+    {"id": "ada", "name": "Ada", "age": 36, "email": null,
+     "role": "member", "tags": [], "note": "n"}
+  ],
+  "bad_lines": [
+    {"offset": 531, "line": 6, "reason": "invalid json: Expecting property name enclosed in double quotes at col 2", "raw": "{bad\n"}
+  ]
+}
+```
+
+`get <id> --json` returns the same document with one `record` in place of
+`records`.
+
+**`revision`** names the store snapshot the answer was folded from. All three
+values are read under the same lock as the fold, so records can never be
+labelled with a revision they did not come from. Compaction rewrites the log
+through a rename, so the inode changes even when no record did; a store that
+does not exist yet reports `{"inode": null, "size": 0, "mtime_ns": null}`.
+
+**`records`** / **`record`** are live records after the fold: last write wins,
+tombstones applied, contract defaults materialised. Every contract type lands on
+its standard JSON encoding - ISO-8601 for `datetime`, `date` and `time`, a
+string for `uuid` and `email`, the bare value for an `enum`, an array for
+`list`, an object for `dict`, `null` for an absent optional. Nothing is
+re-encoded as a string.
+
+**`bad_lines`** carries one entry per unreadable line, so a damaged store can
+never be mistaken for a smaller clean one. The three failure modes below all
+appear here, with the `offset` and `line` to find them at.
+
+`--fields` and `--limit` behave as they do in TOON mode, over the same order.
+Unlike TOON mode, `--json` returns every field and never truncates a value, so
+`--full` adds nothing to `get --json`. Failures keep their exit codes and stay
+JSON. An id that is not there exits 1 and still answers with the whole envelope,
+`record` explicitly null:
+
+```json
+{
+  "error": "no record with id 'nobody' in users.jsonl",
+  "code": "NOT_FOUND",
+  "revision": {"inode": 10392462, "size": 572, "mtime_ns": 1788083736341297500},
+  "record": null,
+  "bad_lines": [
+    {"offset": 531, "line": 6, "reason": "invalid json: Expecting property name enclosed in double quotes at col 2", "raw": "{bad\n"}
+  ],
+  "help": ["Run `datafile.py -f users.jsonl list` to see available ids"]
+}
+```
+
+That is the one failure that carries the envelope, and it has to: the line the
+consumer asked for may be one of the unreadable ones, and an error on its own
+would let it read "damaged" as "not there". Every other failure is the error
+alone, because no snapshot was folded to describe.
+
+The cost of the guarantees is that `--json` folds the whole log, where TOON
+`list` pages the offset index: `bad_lines` can only be complete for a reader
+that saw every line. That is why the flag is opt-in rather than the default.
 
 ## Recovering broken data
 
@@ -407,7 +479,7 @@ defends against, and only power-loss testing on real hardware would settle it.
 ## Development
 
 ```sh
-uv run test_datafile.py                                          # 287 tests
+uv run test_datafile.py                                          # 308 tests
 uv run test_datafile.py --cov=. --cov-branch --cov-report=term-missing
 datafile.py skill --check && datafile.py pi-package --check      # drift gates
 ```

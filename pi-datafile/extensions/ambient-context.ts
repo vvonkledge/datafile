@@ -2,16 +2,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 
-// Tried in order. The bare name works when datafile is on PATH (the
-// portable case, so this package works on someone else's machine); the second
-// entry is the absolute path baked in when the package was generated.
-const CANDIDATES: string[][] = [["datafile"], ["/etc/profiles/per-user/vvonkledge/bin/uv", "run", "/Users/vvonkledge/vvonkledge/sandbox/datafile/datafile.py"]];
+// Resolved where the package runs, never at generation time. An absolute path
+// baked in here would name one machine's checkout, and would make the same
+// commit generate different bytes in every checkout, so `pi-package --check`
+// could only ever pass where the generator last ran.
+const COMMAND = "datafile";
 const TIMEOUT_MS = 10000;
 const HEADER = "## AXI ambient context: datafile";
+const NOT_INSTALLED = "pi-datafile: could not run `datafile`, so this session has no ambient store context. Put it on PATH (`just install` in the datafile checkout, or link datafile.py onto PATH as `datafile`), then start a new session.";
 
-function tryOne(argv: string[], cwd: string): Promise<string | null> {
+// Resolves to the view, to "" when datafile ran but had nothing usable to
+// say, or to null when it could not be started at all - the one failure that
+// is a setup problem the user can fix rather than a store to read.
+function homeView(cwd: string): Promise<string | null> {
   return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), {
+    const child = spawn(COMMAND, [], {
       cwd,
       env: process.env,
       shell: false,
@@ -27,32 +32,28 @@ function tryOne(argv: string[], cwd: string): Promise<string | null> {
     };
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      done("");
-    }, TIMEOUT_MS);   // timed out: give up rather than try the next candidate
+      done("");            // a slow store is not a missing command
+    }, TIMEOUT_MS);
     child.stdout?.setEncoding("utf-8");
     child.stdout?.on("data", (chunk) => {
       out += chunk;
     });
-    // null means "this candidate is not usable, try the next one".
-    child.on("error", () => done(null));
-    child.on("close", (code) => done(code === 0 ? out.trim() : null));
+    child.on("error", () => done(null));   // not on PATH, or not executable
+    child.on("close", (code) => done(code === 0 ? out.trim() : ""));
   });
-}
-
-async function homeView(cwd: string): Promise<string> {
-  for (const argv of CANDIDATES) {
-    const result = await tryOne(argv, cwd);
-    // Ambient context is best-effort: a failure must not corrupt the prompt.
-    if (result !== null) return result;
-  }
-  return "";
 }
 
 export default function (pi: ExtensionAPI) {
   let ambient = "";
 
   pi.on("session_start", async (_event, ctx) => {
-    ambient = await homeView(ctx.cwd);
+    const view = await homeView(ctx.cwd);
+    // Ambient context is best-effort: a failure must not corrupt the prompt,
+    // so the only thing an unusable datafile costs is the context itself.
+    // A missing command is worth one line on stderr, because it is the only
+    // failure the reader of that line can do something about.
+    if (view === null) console.error(NOT_INSTALLED);
+    ambient = view ?? "";
   });
 
   pi.on("before_agent_start", async (event) => {

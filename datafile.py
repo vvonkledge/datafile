@@ -55,6 +55,18 @@ class BadLine(NamedTuple):
     raw: str
 
 
+class Revision(NamedTuple):
+    """Which physical state of the log a read was taken from.
+
+    Every append moves size and mtime; compaction rewrites the log through a
+    temp file and a rename, so the inode changes even when the folded records
+    do not. The three together name a snapshot, which is what a consumer needs
+    to tell "nothing has changed" from "I read an older store"."""
+    inode: int | None    # None when the log does not exist yet
+    size: int
+    mtime_ns: int | None
+
+
 class Store(Generic[M]):
     def __init__(self, path: str, model: type[M], key: str = "id"):
         if key not in model.model_fields:
@@ -270,6 +282,25 @@ class Store(Generic[M]):
                 bad.append(BadLine(off, ln, f"contract violation: {detail}",
                                    json.dumps(rec)))
         return alive, bad
+
+    def snapshot(self) -> tuple[Revision, dict[str, M], list[BadLine]]:
+        """One fold, plus the revision of the bytes it folded.
+
+        Taking the stat inside the same shared lock as the fold is the whole
+        point: a writer cannot append or compact between the two, so these
+        records can never be labelled with a revision they did not come from.
+        This is the single read behind `list --json` and `get --json`."""
+        with self._lock(shared=True):
+            rev = self._revision_unlocked()
+            alive, bad = self._load_unlocked()
+            return rev, alive, bad
+
+    def _revision_unlocked(self) -> Revision:
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return Revision(None, 0, None)      # an absent log is a real state
+        return Revision(st.st_ino, st.st_size, st.st_mtime_ns)
 
     # ------------------------------------------------------------ maintenance
 
@@ -682,6 +713,9 @@ DESCRIPTION = "Append-only JSONL record store with a runtime YAML contract"
 # The name this was invoked as, so suggested commands are runnable as typed.
 # Set in main(); importing this module must not pick up the importer's argv[0].
 PROG = "datafile.py"
+# Which encoder emit() uses. Set in main() from `--json`, which only `list` and
+# `get` accept; every other command is TOON-only, as is a bare `datafile.py`.
+JSON_OUTPUT = False
 DETAIL_TRUNCATE = 800     # §3
 CELL_TRUNCATE = 80
 DEFAULT_LIMIT = 100       # §2: high enough to cover common cases in one call
@@ -700,9 +734,16 @@ def emit(payload: dict) -> None:
 
     Suggestions are authored against `datafile.py`; rewrite them to whatever name
     this was invoked as, so §9's "every suggestion is a complete command" holds
-    for a globally installed alias too."""
+    for a globally installed alias too.
+
+    Under `--json` the same payload is encoded as JSON instead of TOON, errors
+    included, so a caller that asked for JSON never has to parse two formats to
+    find out that its request failed."""
     if PROG != "datafile.py" and isinstance(payload.get("help"), list):
         payload["help"] = [h.replace("datafile.py", PROG) for h in payload["help"]]
+    if JSON_OUTPUT:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
     text = toon(payload)
     if text:
         print(text)
@@ -906,9 +947,85 @@ def _default_fields(model, key: str) -> list[str]:
     return [key, *(req + opt)[:3]]
 
 
+# ------------------------------------------------- the JSON boundary (public)
+# `--json` is a supported machine contract, not a rendering option, so the two
+# encoders differ in more than shape and the differences are all here:
+#
+#   TOON                                  JSON
+#   paged through the offset index        one full fold under one read lock
+#   a count of unreadable lines           every unreadable line, in full
+#   key + first three fields by default   every field of every record
+#   values clipped to a cell width        canonical values, never clipped
+#   no revision                           the revision the fold came from
+#
+# The clipping and the default field set are token economy for a human or an
+# agent reading a table; both would corrupt a value a program is going to act
+# on. The full fold is what buys the other two guarantees: bad lines can only
+# be reported line by line by a reader that saw every line, and a revision is
+# only honest about a set of records if it was stat'd under the lock that
+# produced them.
+
+
+def _json_bad_lines(bad: list[BadLine]) -> list[dict]:
+    """Corruption is data, not a footnote: every unreadable line is reported
+    with where it is and what is wrong with it, so a consumer can never mistake
+    a damaged store for a smaller clean one."""
+    return [b._asdict() for b in bad]
+
+
+def _json_record(record, fields: list[str] | None) -> dict:
+    """Pydantic's JSON mode, so every contract type lands on its standard JSON
+    encoding: ISO-8601 for datetime/date/time, a string for uuid and email, the
+    bare value for an enum, native arrays and objects for list and dict, and
+    null for an absent optional. Nothing is re-encoded as a string."""
+    d = record.model_dump(mode="json")
+    return {f: d[f] for f in fields} if fields else d
+
+
+def _list_json(args, s: Store, fields: list[str] | None) -> int:
+    rev, alive, bad = s.snapshot()
+    live = list(alive.values())          # insertion order, as the TOON page is
+    shown = live[:args.limit] if args.limit > 0 else []
+    emit({"revision": rev._asdict(),
+          "records": [_json_record(r, fields) for r in shown],
+          "bad_lines": _json_bad_lines(bad)})
+    return 0
+
+
+def _get_json(args, s: Store, key: str) -> int:
+    """The same fold as `list --json`, not `get`'s O(1) index read: one record
+    still has to be labelled with the revision it came from and carry the bad
+    lines of that snapshot, and neither is knowable from a single seek."""
+    rev, alive, bad = s.snapshot()
+    record = alive.get(args.id)
+    # A miss is an answer about the store, not a failure to read it, so it
+    # carries the same envelope as a hit: the revision it was decided against,
+    # and every bad line in that snapshot. Reporting absence with the error
+    # alone would hide corruption exactly when it matters most - the line the
+    # consumer asked for may be one of the unreadable ones, and "not found"
+    # would let it read that as "not there". `record: null` says which of the
+    # two it is; the error and the exit code stay what `get` has always used.
+    envelope = {"revision": rev._asdict(),
+                "record": _json_record(record, None) if record is not None else None,
+                "bad_lines": _json_bad_lines(bad)}
+    if record is None:
+        raise _not_found(args, key, envelope)
+    emit(envelope)
+    return 0
+
+
+def _not_found(args, key: str, extra: dict | None = None) -> AxiError:
+    """Shared so `get` and `get --json` cannot drift on what missing means or
+    on what it exits with; only the encoding and the JSON envelope differ."""
+    return AxiError(f"no record with {key} {args.id!r} in {args.file}", "NOT_FOUND",
+                    [f"Run `datafile.py -f {args.file} list` to see available ids"],
+                    1, extra)
+
+
 def cmd_list(args) -> int:
     s, model, key = _open(args)
 
+    fields = None
     if args.fields:                          # a usage error should not read the log
         fields = [f.strip() for f in args.fields.split(",") if f.strip()]
         unknown = [f for f in fields if f not in model.model_fields]
@@ -916,9 +1033,11 @@ def cmd_list(args) -> int:
             raise AxiError(
                 f"unknown field(s) {unknown} for this contract", "USAGE_ERROR",
                 [f"Valid fields: {', '.join(model.model_fields)}"], 2)
-    else:
-        fields = _default_fields(model, key)
 
+    if args.json:
+        return _list_json(args, s, fields)
+
+    fields = fields or _default_fields(model, key)
     shown, total, bad = s.page(args.limit)
 
     if not total:                                          # §5
@@ -966,10 +1085,11 @@ def cmd_list(args) -> int:
 
 def cmd_get(args) -> int:
     s, _model, key = _open(args)
+    if args.json:
+        return _get_json(args, s, key)
     rec = s.get(args.id)
     if rec is None:
-        raise AxiError(f"no record with {key} {args.id!r} in {args.file}", "NOT_FOUND",
-                       [f"Run `datafile.py -f {args.file} list` to see available ids"], 1)
+        raise _not_found(args, key)
     d = rec.model_dump(mode="json")
     truncated = []
     if not args.full:
@@ -1715,6 +1835,15 @@ def render_skill() -> str:
         "Output is TOON on stdout, including errors, which carry a `code:` and",
         "`help:` suggestions. Nothing is written to stderr.",
         "",
+        "`list --json` and `get --json` swap TOON for a single JSON document, for",
+        "a program that has to parse the output rather than read it: every field",
+        "of every live record untruncated, the `revision` (inode, size, mtime_ns)",
+        "of the store snapshot they were folded from, and a `bad_lines` entry for",
+        "every unreadable line. Failures stay JSON in that mode, with the same",
+        "exit codes: `get --json` for an id that is not there exits 1 and still",
+        "returns that document, `record` null beside the revision and the bad",
+        "lines, so corruption stays visible when the id you asked for is not.",
+        "",
         "| exit | meaning |",
         "| --- | --- |",
         "| 0 | success, including idempotent no-ops |",
@@ -1804,7 +1933,7 @@ PI_PACKAGE_DIR = "pi-" + TOOL_NAME
 PI_PACKAGE_VERSION = VERSION
 
 
-def _pi_extension(argv: list[str]) -> str:
+def _pi_extension() -> str:
     """A pi extension that injects the home view as ambient context.
 
     pi has no command-hook mechanism like Claude Code or Codex; extensions are
@@ -1815,16 +1944,25 @@ def _pi_extension(argv: list[str]) -> str:
 import type {{ ExtensionAPI }} from "@earendil-works/pi-coding-agent";
 import {{ spawn }} from "node:child_process";
 
-// Tried in order. The bare name works when {TOOL_NAME} is on PATH (the
-// portable case, so this package works on someone else's machine); the second
-// entry is the absolute path baked in when the package was generated.
-const CANDIDATES: string[][] = {json.dumps([[TOOL_NAME], argv])};
+// Resolved where the package runs, never at generation time. An absolute path
+// baked in here would name one machine's checkout, and would make the same
+// commit generate different bytes in every checkout, so `pi-package --check`
+// could only ever pass where the generator last ran.
+const COMMAND = {json.dumps(TOOL_NAME)};
 const TIMEOUT_MS = {HOOK_TIMEOUT * 1000};
 const HEADER = {json.dumps(f"## AXI ambient context: {TOOL_NAME}")};
+const NOT_INSTALLED = {json.dumps(
+    f"{PI_PACKAGE_DIR}: could not run `{TOOL_NAME}`, so this session has no "
+    f"ambient store context. Put it on PATH (`just install` in the {TOOL_NAME} "
+    f"checkout, or link {TOOL_NAME}.py onto PATH as `{TOOL_NAME}`), then start "
+    f"a new session.")};
 
-function tryOne(argv: string[], cwd: string): Promise<string | null> {{
+// Resolves to the view, to "" when {TOOL_NAME} ran but had nothing usable to
+// say, or to null when it could not be started at all - the one failure that
+// is a setup problem the user can fix rather than a store to read.
+function homeView(cwd: string): Promise<string | null> {{
   return new Promise((resolve) => {{
-    const child = spawn(argv[0], argv.slice(1), {{
+    const child = spawn(COMMAND, [], {{
       cwd,
       env: process.env,
       shell: false,
@@ -1840,32 +1978,28 @@ function tryOne(argv: string[], cwd: string): Promise<string | null> {{
     }};
     const timer = setTimeout(() => {{
       child.kill("SIGTERM");
-      done("");
-    }}, TIMEOUT_MS);   // timed out: give up rather than try the next candidate
+      done("");            // a slow store is not a missing command
+    }}, TIMEOUT_MS);
     child.stdout?.setEncoding("utf-8");
     child.stdout?.on("data", (chunk) => {{
       out += chunk;
     }});
-    // null means "this candidate is not usable, try the next one".
-    child.on("error", () => done(null));
-    child.on("close", (code) => done(code === 0 ? out.trim() : null));
+    child.on("error", () => done(null));   // not on PATH, or not executable
+    child.on("close", (code) => done(code === 0 ? out.trim() : ""));
   }});
-}}
-
-async function homeView(cwd: string): Promise<string> {{
-  for (const argv of CANDIDATES) {{
-    const result = await tryOne(argv, cwd);
-    // Ambient context is best-effort: a failure must not corrupt the prompt.
-    if (result !== null) return result;
-  }}
-  return "";
 }}
 
 export default function (pi: ExtensionAPI) {{
   let ambient = "";
 
   pi.on("session_start", async (_event, ctx) => {{
-    ambient = await homeView(ctx.cwd);
+    const view = await homeView(ctx.cwd);
+    // Ambient context is best-effort: a failure must not corrupt the prompt,
+    // so the only thing an unusable {TOOL_NAME} costs is the context itself.
+    // A missing command is worth one line on stderr, because it is the only
+    // failure the reader of that line can do something about.
+    if (view === null) console.error(NOT_INSTALLED);
+    ambient = view ?? "";
   }});
 
   pi.on("before_agent_start", async (event) => {{
@@ -1889,18 +2023,18 @@ def _pi_manifest() -> str:
     }, indent=2) + "\n"
 
 
-def _pi_readme(argv: list[str]) -> str:
-    # No absolute paths here: the README must be byte-identical wherever it is
-    # generated, or `pi-package --check` fails spuriously in CI.
+def _pi_readme() -> str:
+    # Nothing machine-specific here, and nothing machine-specific in any other
+    # generated file: the same commit must produce the same bytes in every
+    # checkout, or `pi-package --check` is a gate only one machine can pass.
     return f"""# {PI_PACKAGE_DIR}
 
 A [pi package](https://pi.dev) for {TOOL_NAME}: {DESCRIPTION}.
 
 Generated by `datafile.py pi-package`. Do not edit by hand - regenerate instead.
-`datafile.py pi-package --check` catches drift, but only on the machine that
-generated the package: the absolute fallback path below is baked in at
-generation time, so the check fails anywhere else. In CI, check the skill
-instead - it carries no machine-specific paths.
+`datafile.py pi-package --check` catches drift, and it is portable: the
+generated files carry no path from the machine that generated them, so the same
+commit checks clean anywhere, CI included.
 
 ## Install
 
@@ -1919,44 +2053,35 @@ account.
   `session_start` and appends it to the system prompt, so a session opens
   already knowing which stores exist.
 
-The extension shells out to `{TOOL_NAME}` if it is on `PATH`, otherwise to the
-absolute path baked in when this package was generated:
+The extension runs `{TOOL_NAME}` from `PATH`, resolved on the machine the
+session runs on. If it is not there, the session opens without ambient context
+and the extension prints how to install it; it never reaches for a path from
+another machine.
 
-```
-{" ".join(argv)}
-```
-
-For the package to work on another machine, install `{TOOL_NAME}` on `PATH`
-there. Otherwise regenerate the package on that machine.
+To put `{TOOL_NAME}` on `PATH`, run `just install` in the {TOOL_NAME} checkout,
+or link `{TOOL_NAME}.py` onto `PATH` as `{TOOL_NAME}` by hand.
 """
 
 
-def _pi_files(argv: list[str]) -> dict[str, str]:
+def _pi_files() -> dict[str, str]:
     return {
         os.path.join("package.json"): _pi_manifest(),
-        os.path.join("README.md"): _pi_readme(argv),
-        os.path.join("extensions", "ambient-context.ts"): _pi_extension(argv),
+        os.path.join("README.md"): _pi_readme(),
+        os.path.join("extensions", "ambient-context.ts"): _pi_extension(),
         os.path.join("skills", SKILL_NAME, "SKILL.md"): render_skill(),
     }
 
 
 def cmd_pi_package(args) -> int:
-    import shutil
-    uv = shutil.which("uv")
-    if not uv:
-        raise AxiError("uv not found on PATH", "SETUP_ERROR",
-                       ["Install uv, then re-run `datafile.py pi-package`"], 1)
     root = args.out or PI_PACKAGE_DIR
-    # Deliberately not _hook_argv: that prefers a bare PATH alias, which is
-    # right for a hook but wrong here, because CANDIDATES[0] already is the
-    # bare name. Reusing it collapsed the package to [["datafile"],
-    # ["datafile"]] once the script was symlinked onto PATH, leaving a machine
-    # without datafile on PATH no fallback at all.
-    #
-    # realpath, not abspath: invoked through that symlink, __file__ is the
-    # symlink, so the two spellings of the same install baked different paths
-    # and --check reported drift against itself.
-    files = _pi_files([uv, "run", os.path.realpath(__file__)])
+    # Nothing about this machine reaches the output. An earlier version baked
+    # `uv run <realpath of this script>` in as a PATH fallback, which made the
+    # generated bytes a function of the checkout directory: the same commit
+    # produced two different packages in two worktrees, and `--check` could
+    # only pass where the generator last ran. The package resolves `datafile`
+    # from PATH at session start instead, which is the only spelling that is
+    # true on a machine other than this one.
+    files = _pi_files()
 
     stale = []
     for rel, want in files.items():
@@ -1981,8 +2106,8 @@ def cmd_pi_package(args) -> int:
     emit({"package": collapse_home(root),
           "files": sorted(files),
           "help": [f"Run `pi install {os.path.abspath(root)}` to install it",
-                   "Run `datafile.py pi-package --check` to catch drift on this "
-                   "machine (it bakes in an absolute path, so it fails elsewhere)"]})
+                   "Run `datafile.py pi-package --check` in CI to fail on a "
+                   "stale package"]})
     return 0
 
 
@@ -2015,17 +2140,25 @@ def build_parser() -> tuple[AxiParser, dict]:
 
     sp = add("get", "read one record",
              "examples:\n  datafile.py -f u.jsonl get a1\n"
-             "  datafile.py -f u.jsonl get a1 --full")
+             "  datafile.py -f u.jsonl get a1 --full\n"
+             "  datafile.py -f u.jsonl get a1 --json")
     sp.add_argument("id")
     sp.add_argument("--full", action="store_true",
                     help=f"do not truncate values (default: {DETAIL_TRUNCATE} chars)")
+    sp.add_argument("--json", action="store_true",
+                    help="emit one JSON document: revision, record, bad_lines "
+                         "(never truncated, so --full is redundant)")
 
     sp = add("list", "list records",
              "examples:\n  datafile.py -f u.jsonl list\n"
-             "  datafile.py -f u.jsonl list --fields id,name,age --limit 500")
+             "  datafile.py -f u.jsonl list --fields id,name,age --limit 500\n"
+             "  datafile.py -f u.jsonl list --json")
     sp.add_argument("--fields", help="comma-separated fields (default: key + first 3)")
     sp.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                     help=f"max records (default: {DEFAULT_LIMIT})")
+    sp.add_argument("--json", action="store_true",
+                    help="emit one JSON document: revision, records, bad_lines "
+                         "(every field, untruncated, unless --fields narrows it)")
 
     sp = add("keys", "list record ids only",
              "examples:\n  datafile.py -f u.jsonl keys\n"
@@ -2119,7 +2252,8 @@ COMMANDS = {"put": cmd_put, "get": cmd_get, "list": cmd_list, "keys": cmd_keys,
 
 
 def main(argv=None) -> int:
-    global PROG
+    global PROG, JSON_OUTPUT
+    JSON_OUTPUT = False          # never inherited from an earlier in-process call
     if argv is None:
         PROG = os.path.basename(sys.argv[0]) or "datafile.py"
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -2132,6 +2266,10 @@ def main(argv=None) -> int:
             args = parser.parse_args(argv)
         except _Usage as u:
             cmd = next((a for a in argv if a in subs), None)
+            # The parse failed, so there is no args.json to read; a caller that
+            # asked for JSON still gets JSON, or its parser chokes on the one
+            # output it cannot handle - the one telling it what it got wrong.
+            JSON_OUTPUT = cmd in ("list", "get") and "--json" in argv
             valid = [*_flags_of(subs[cmd]), "--file", "--contract"] if cmd \
                 else _flags_of(parser)
             raise AxiError(
@@ -2139,6 +2277,8 @@ def main(argv=None) -> int:
                 [f"valid flags for `{cmd or PROG}`: {', '.join(sorted(set(valid)))}",
                  f"Run `{PROG} {cmd or ''} --help` for the full reference".replace("  ", " ")],
                 2) from None
+
+        JSON_OUTPUT = getattr(args, "json", False)   # only list and get carry it
 
         if args.version:
             print(VERSION)
